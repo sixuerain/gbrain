@@ -155,3 +155,38 @@ use generic placeholders (`alice-example`, `acme-example`, `fund-a`).
 
 If you are a fork, regenerate `llms.txt` + `llms-full.txt` with your own URL base before
 publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork/main bun run build:llms`.
+
+## COP-SLT 项目工作规则(优先级高)
+
+这是 lhe 的 COP-SLT(T268 CoP SLT release package)项目跟踪约定。
+
+- **会话/会议收尾时,必须**把该次新提出的问题追加到
+  `~/notes/workspace/cop-slt/analysis/luke-he-question-log` 并按分类更新计数
+  (分类: 工具/领域/策略)。这是强制执行,不能只声明而不做。
+- **Pulsar 任务收尾时,必须**按 `~/notes/workspace/pulsar/wrap-up/SKILL.md` 的强制
+  清单同步项目内所有相关文档状态(新 evidence→sources、综合→analysis、看板行→
+  tracking/ongoing-followup、landing page→home.md 快速入口/主线/时间线/目录导航、
+  worklog、回链、验证、commit & push),不能只把新内容写进单个 source/analysis 就提交。
+  这是强制执行,不能只声明而不做。
+- 涉及 cop-slt 知识库写入/修改后,**及时 commit & push** 到 GitLab(`~/notes`)。
+- cop-slt 页面只在 Linux 侧写入;Windows/Obsidian 只读。
+- 冲突时保留 Linux(brain 权威)版本。
+
+### Windows/Obsidian 同步模型(只读查看 + 仅手动 git pull)
+Windows A repo = `C:\Users\lhe\Projects\gitlab\my-docs`,与 `~/notes` 同一 GitLab(remote
+`ssh://git@gitlab-master.nvidia.com:12051/lhe/my-docs.git`)。**单写者**:Linux 唯一写源,
+Windows 只读(Obsidian 查看/编辑,冲突保留 Linux 版)。
+
+- **2026-09-14 用户新约定：关闭所有自动提交/同步，仅手动 `git pull`**，替代此前保留 auto-pull 的约定。
+  Obsidian Git：`autoSaveInterval=0`、`autoPushInterval=0`、`autoPullInterval=0`、
+  `autoPullOnBoot=false`、`autoBackupAfterFileChange=false`、`disablePush=true`；
+  `syncMethod=rebase` 仅保留为插件非 merge 设置，不启用自动同步。
+  Windows 仓库设置 `pull.ff=only`、`pull.rebase=false`、`branch.main.rebase=false`：
+  手动 `git pull` 仅允许快进，分叉时停止，不自动 merge/rebase，不恢复 auto-pull。
+- **`.obsidian/workspace.json` 不入库**(已 untrack 进 `.gitignore`):这是 Obsidian 每次
+  切换界面就重写的高频脏文件,是历史大部分 `M`/conflict 的元凶。不要重新 add 它。
+- 遇 Windows 分叉/冲突(如 `[ahead N, behind N]`、`UU`、`MERGING`):**abort/`reset --hard
+  origin/main` 对齐 origin**,保留 Linux 版;勿在 Windows 侧制造本地 merge commit。
+- 访问 Windows A 用 ob-acp-gate 的 unix socket HTTP(`%XDG_RUNTIME_DIR%/ob-acp/*.sock`);
+  授权 8h 过期时 `ob-acp-gate request` 让用户在 launcher 读新 passcode 再 `passcode <CODE>`。
+- 修改 Windows 上 obsidian-git 的 `data.json` 走 `ConvertTo-Json`(勿手改 JSON),保持上列非默认项。
