@@ -160,6 +160,9 @@ publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork
 
 这是 lhe 的 COP-SLT(T268 CoP SLT release package)项目跟踪约定。
 
+- **收尾绑定到本会话所属项目**:一次会话只对本会话实际触碰的项目(如 cop-slt / Pulsar / 其他)
+  做收尾;不跨项目把无关库也一起“顺便收尾”,也不把 A 项目的状态/问题混入 B 项目的收尾。
+  同一会话里若确需处理多个项目,各自的收尾分开做、分开 commit。这是通用原则,避免库越来越乱。
 - **会话/会议收尾时,必须**把该次新提出的问题追加到
   `~/notes/workspace/cop-slt/analysis/luke-he-question-log` 并按分类更新计数
   (分类: 工具/领域/策略)。这是强制执行,不能只声明而不做。
