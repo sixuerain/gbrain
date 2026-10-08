@@ -169,14 +169,22 @@ export function dimsProviderOptions(
   const matchId = modelMatchKey(modelId);
   switch (implementation) {
     case 'native-openai': {
+      // Hub-form ids (e.g. NVIDIA Inference Hub `azure/openai/text-embedding-3-small`)
+      // end with the native OpenAI model name. Fold the last path segment so the
+      // text-embedding-3 Matryoshka branch and its dim tables still apply; the
+      // folded id is match-only — the wire `model` field keeps the original
+      // hub id verbatim (#4123).
+      const nativeOpenAIId = matchId.includes('/text-embedding-3')
+        ? matchId.slice(matchId.lastIndexOf('/') + 1)
+        : matchId;
       // text-embedding-3-* supports dimensions; text-embedding-ada-002 does not.
       // OpenAI embeddings are symmetric — inputType ignored.
-      if (matchId.startsWith('text-embedding-3')) {
+      if (nativeOpenAIId.startsWith('text-embedding-3')) {
         // v0.36.0.0 (D13): fail-loud when configured dim is outside the
         // model's Matryoshka range. OpenAI returns HTTP 400 otherwise with
         // a generic message that misroutes as a network blip.
-        if (isOpenAITextEmbedding3Model(modelId) && !isValidOpenAITextEmbedding3Dim(modelId, dims)) {
-          const max = maxOpenAITextEmbedding3Dim(modelId)!;
+        if (isOpenAITextEmbedding3Model(nativeOpenAIId) && !isValidOpenAITextEmbedding3Dim(nativeOpenAIId, dims)) {
+          const max = maxOpenAITextEmbedding3Dim(nativeOpenAIId)!;
           throw new AIConfigError(
             `OpenAI model "${modelId}" supports embedding_dimensions in 1..${max}, got ${dims}.`,
             `Use a width between 1 and ${max} (${Math.min(1024, max)} is a common default). On an existing brain a width change re-embeds; ` +
