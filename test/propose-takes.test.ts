@@ -60,6 +60,7 @@ function buildMockEngine(opts: {
     },
     async executeRaw<T>(sql: string, params?: unknown[]): Promise<T[]> {
       captured.push({ sql, params: params ?? [] });
+      if (sql.includes('FROM persistence_brain')) return [{ enabled: false } as unknown as T]; // #6482: the strict mode reader needs one well-formed unmanaged row.
       // Narrow candidate-page projection (replaces listPages in the phase).
       if (sql.includes('SELECT slug, source_id, compiled_truth')) {
         return opts.pages.map((p) => ({
@@ -679,6 +680,25 @@ New prose appended here.`;
         expect(result.status).toBe('skipped');
         expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
         // Skips BEFORE touching the engine — no page scan, no cache probes.
+        expect(captured).toHaveLength(0);
+      } finally {
+        resetGateway();
+      }
+    });
+  });
+
+  test('default extractor skips cleanly when a non-Anthropic chat model has no key (#6705)', async () => {
+    await withEnv({ GBRAIN_HOME: emptyHome(), OPENAI_API_KEY: undefined }, async () => {
+      configureGateway({ chat_model: 'openai:gpt-5.6', env: {} });
+      try {
+        const { engine, captured } = buildMockEngine({
+          pages: [buildPage({ slug: 'wiki/c', body: 'claim-ish prose' })],
+        });
+        const result = await runPhaseProposeTakes(buildCtx(engine));
+
+        expect(result.status).toBe('skipped');
+        expect((result.details as Record<string, unknown>).reason).toBe('no_provider');
+        expect(result.summary).toContain('OPENAI_API_KEY');
         expect(captured).toHaveLength(0);
       } finally {
         resetGateway();

@@ -494,7 +494,7 @@ What the arms say:
   and autocut off, expansion costs thirteen questions against `balanced`
   (+2 / −15: multi-session −7, temporal −5) plus the Haiku call per query.
   `gbrain config set search.mode balanced` keeps the reranker and drops
-  expansion (`gbrain query` still expands in every mode unless `--no-expand`);
+  expansion (`gbrain query` no longer expands under `balanced` unless `--expand`);
   `gbrain config set search.expansion_variant_budget 0.25`
   recovers most of the loss if you keep it on.
 - **Slot starvation is not the miss class** (from the 2026-09-02 sibling run;
@@ -563,6 +563,22 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
   --mode balanced --reranker on --autocut off \
   --output ~/lme-receipts/default.ndjson
 
+# Through the real operation instead of the core library: --via-operation query|search
+# runs each question as an agent's stdio MCP call would (remote, stdio, source
+# `default`), at the operation's own default limit and under the brain's resolved
+# search mode, so a receipt reproduces from a tagged gbrain. `query` expands by the
+# mode (on only in tokenmax) unless --op-expand on|off says otherwise. Each row's
+# `via_operation` records the context, the `expand` sent, model calls per
+# touchpoint, latency, the CRAG grade and the expansion outcome;
+# run_config.via_operation_summary has the tree, p50/p95 latency and model calls
+# per query. A run that expects expansion fails (exit 1) when any question did
+# not expand (`expansion_not_applied`); --expansion, --keyword-only and
+# --capture-pool are refused with it.
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
+  --retrieval-only --top-k 5 --by-type --no-trajectory \
+  --mode balanced --reranker on --via-operation query --op-expand off \
+  --output ~/lme-receipts/query-balanced-noexpand.ndjson
+
 # Embeddings are cached content-addressed at ~/.cache/gbrain-eval/longmemeval-embed.sqlite
 # (--embed-cache FILE to relocate, --no-embed-cache to disable), so every arm after
 # the first sees byte-identical vectors; run_config.cache.misses must be 0 for a
@@ -587,6 +603,22 @@ gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
 
 # The hypotheses in that file also score under LongMemEval's own evaluate_qa.py
 # (not bundled): python evaluate_qa.py ~/lme-receipts/judged.ndjson
+```
+
+### Pricing a run before it starts (`--call-plan`)
+
+`--call-plan FILE` writes gstack's eval call plan (wire format GSTACK_EVAL_CALLS v1)
+for the exact run the other flags describe and exits 0, with no provider call and
+no brain: one line per active lane (model, calls, input and output tokens, the
+per-call output cap), the gate command, the commit, and the preconditions the
+numbers rest on. `gstack-eval-plan price-gate` prices it. Counts are exact for the
+claim extractor and synopsis lanes and upper bounds elsewhere (reader context =
+the K largest sessions of each haystack); caches and retries are not subtracted.
+Lanes it cannot bound (`--decide*`, `--via-operation`) refuse.
+
+```bash
+gbrain eval longmemeval ~/datasets/longmemeval/longmemeval_s_cleaned.json \
+  --mode tokenmax --judge --call-plan ~/lme-receipts/tokenmax-judge.calls
 ```
 
 ### Judged answer accuracy (`--judge`)
@@ -1207,7 +1239,11 @@ bun test test/nightly-quality-probe.test.ts
 score for your brain. It answers the 10 committed questions in
 `test/fixtures/longmemeval-nightly.jsonl` from an isolated in-memory
 benchmark brain, with your search mode, reranker and model routes, and has
-three judges grade the answers. A PASS says the retrieval-plus-answer
+three judges grade the answers. It uses the direct reader (`--reader-mode
+direct`, the original terse prompt and 512-token budget), because the judges
+grade directness and the default notes reader's notes and reasoning would be
+graded as the answer (#6627). Standalone `gbrain eval longmemeval` runs keep
+the notes default. A PASS says the retrieval-plus-answer
 pipeline and the judges work end to end tonight; it says nothing about the
 pages in your own brain. The fixture is embedded in the gbrain binary, so
 source checkouts and compiled installs run the same probe.

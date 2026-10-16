@@ -30,7 +30,10 @@
  * `ContentRepairReceipt` (`contentRepair`), outcome field `content_repair`,
  * subject `gbrain: repair frontmatter slug in <path>` and trailer
  * `gbrain-repair: frontmatter_slug_conflict <tier> <confidence>`; its
- * refusals route to `gbrain repair content`.
+ * refusals route to `gbrain repair content`. #6696 C8: an intent carrying
+ * `holdObservedAt` (the slug-conflict `import` of unchanged held bytes)
+ * clears the hold only while it is that observation, so a hold a sync wrote
+ * after the repair read it stays.
  *
  * Trusted local CLI only: admission refuses remote and delegated callers, the
  * `put_page` reserved-field gate refuses the kind from MCP, and the preparer
@@ -44,11 +47,11 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import type { ParsedPage } from '../import-file.ts';
 import { importFromContent } from '../import-file.ts';
-import { ownerImportTrust } from '../trust/channel.ts';
+import { ownerImportTrust, ownerSourceGateInput } from '../trust/channel.ts';
 import { ContentSanityBlockError } from '../content-sanity.ts';
 import { loadImportSanityConfig, type ContentRefusal, type ImportSanityConfig } from '../import-screen.ts';
 import { loadActivePackForEngine } from '../schema-pack/engine-resolution.ts';
-import { parseMarkdown, resolveParsedSubtype, type ParseOpts } from '../markdown.ts';
+import { comparableFrontmatter, parseMarkdown, resolveParsedSubtype, type ParseOpts } from '../markdown.ts';
 import { isWriteTargetContained } from '../path-confine.ts';
 import { opError, type OperationContext } from '../ops/contract.ts';
 import { readFix, trustedCliRequired } from '../ops/op-fix.ts';
@@ -66,7 +69,7 @@ import { getWorktreeBinding } from './ownership.ts';
 import { checkOwner, ownerUnavailableError } from './owner-refusal.ts';
 import { loadRepairBusySet, repairBusy, repairBusyError } from './repair-busy.ts';
 import { submitPageMutation } from './page-mutations.ts';
-import { clearGitHold, recordSyncImportProvenance } from './sync-holds.ts';
+import { clearGitHold, recordSyncImportProvenance, syncDiskProvenance, syncImportParserFor } from './sync-holds.ts';
 import { screenSyncImport } from './sync-prepare.ts';
 import type { SyncRename } from './sync-discovery.ts';
 import type { PreparedContentImport } from './prepared-import.ts';
@@ -96,6 +99,8 @@ export interface ManagedFileRepairIntent extends Record<string, unknown> {
   fenceRepair?: FenceRepairReceipt;
   /** #6377 a slug-conflict repair's receipt (codes and hashes only). */
   contentRepair?: ContentRepairReceipt;
+  /** #6696 C8: the hold observation the repair read; the publication clears the path's hold only while it is that observation (a newer hold stays). */
+  holdObservedAt?: string;
 }
 
 /** The repair command a refusal names (D6 router): a fence repair's, the content repair's, or the frontmatter repair's. */
@@ -179,7 +184,7 @@ export function fileSha256(path: string): string {
 
 /** The canonical page fields a publication stores; what the preview hash binds besides the bytes. */
 export function canonicalRepairFields(page: Pick<ParsedPage, 'type' | 'title' | 'compiled_truth' | 'timeline' | 'frontmatter'>, tags: string[]) {
-  return { type: page.type, title: page.title, body: page.compiled_truth, timeline: page.timeline ?? '', frontmatter: page.frontmatter, tags: [...new Set(tags)].sort() };
+  return { type: page.type, title: page.title, body: page.compiled_truth, timeline: page.timeline ?? '', frontmatter: comparableFrontmatter(page.frontmatter), tags: [...new Set(tags)].sort() };
 }
 
 export interface RepairPublicationInput {
@@ -214,6 +219,7 @@ export async function prepareRepairPublication(engine: BrainEngine, input: Repai
   let result;
   try {
     result = await importFromContent(engine, renamed ? input.base!.page.slug : input.slug, content, { sourceId: input.sourceId, noEmbed: true, remote: false, preserveGateMarkers: true,
+      overrideTier: (await ownerSourceGateInput(engine, input.sourceId, parsedInput.frontmatter)).tier,
       activePack: input.activePack, filename: basename(input.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: input.sourcePath, allowEmptyOverwrite: true,
       prepare: async value => { prepared = value; return value.result; } });
   } catch (error) {
@@ -231,9 +237,9 @@ export async function prepareRepairPublication(engine: BrainEngine, input: Repai
 }
 
 /** The schema pack and content-sanity settings a repair preview and its publication both read, so their results agree. */
-export async function repairScreenConfig(engine: BrainEngine, sourceId: string): Promise<Pick<RepairPublicationInput, 'activePack' | 'sanity'>> {
-  const activePack = (await loadActivePackForEngine(engine, { remote: false, sourceId }).catch(() => null))?.manifest;
-  return { ...(activePack ? { activePack } : {}), sanity: await loadImportSanityConfig(engine) };
+export async function repairScreenConfig(engine: BrainEngine, sourceId: string): Promise<Pick<RepairPublicationInput, 'activePack' | 'sanity'> & { packIdentity: string | null }> {
+  const pack = await loadActivePackForEngine(engine, { remote: false, sourceId }).catch(() => null);
+  return { ...(pack?.manifest ? { activePack: pack.manifest } : {}), sanity: await loadImportSanityConfig(engine), packIdentity: pack?.identity ?? null };
 }
 
 function assertTrustedRepairCaller(ctx: Pick<OperationContext, 'remote'>): void {
@@ -271,6 +277,8 @@ export interface ManagedFileRepairInput {
   fenceRepair?: FenceRepairReceipt;
   /** #6377 set by the `slug-conflicts` kind: the write's receipt, and its refusals route to `gbrain repair content`. */
   contentRepair?: ContentRepairReceipt;
+  /** #6696 C8: clear the hold only while it is this observation. */
+  holdObservedAt?: string;
 }
 
 export async function submitManagedFileRepair(ctx: OperationContext, input: ManagedFileRepairInput): Promise<Record<string, unknown>> {
@@ -296,7 +304,7 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   const kind = repairKindOf(p ?? {});
   if (row.authority.remote || row.principal_kind !== 'local_cli') throw trustedCliRequired('A managed file repair requires a trusted local CLI writer.');
   if (!p || p.kind !== 'managed_file_repair' || typeof p.content !== 'string' || typeof p.path !== 'string' || typeof p.sourcePath !== 'string'
-    || typeof p.beforeHash !== 'string' || typeof p.resultDigest !== 'string') {
+    || typeof p.beforeHash !== 'string' || typeof p.resultDigest !== 'string' || (p.holdObservedAt !== undefined && typeof p.holdObservedAt !== 'string')) {
     throw opError('invalid_params', 'The durable file repair intent is incomplete.',
       `Repair request ${row.request_id} in source ${row.source_id} has no complete intent, so it published nothing. Preview the repair again: gbrain repair ${kind} --source ${row.source_id}.`,
       { fix: previewFix(row.source_id, kind) });
@@ -318,7 +326,7 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   const target = checkFile();
   const source = { sourceId: row.source_id };
   const snapshot = await engine.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
-  assertPageRevision(snapshot, p.expected_revision ? { expectedRevision: p.expected_revision } : {});
+  assertPageRevision(snapshot, { expectedRevision: p.expected_revision ?? null }); // null: admitted against an absent page; still a revision_conflict if one appeared (#5385)
   if ((snapshot?.page.id ?? null) !== row.page_id || (snapshot?.page.source_path != null && snapshot.page.source_path !== p.sourcePath)) {
     throw opError('page_identity_changed', 'The repaired path no longer names the previewed page.',
       `Page ${row.slug} in source ${row.source_id} was replaced, removed, or now maps to a different file than ${p.sourcePath}, so repair request ${row.request_id} published nothing. Preview the repair again.`,
@@ -343,7 +351,8 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
   const ready = publication.ready;
   const project = await prepareCanonicalProjections(engine, ready.parsedPage, row.slug, row.source_id, base, 'file');
   const importContent = p.content.replace(/^\uFEFF/, '');
-  const importOptions = { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, activePack: screenConfig.activePack, filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true };
+  const overrideTier = (await ownerSourceGateInput(engine, row.source_id, parseMarkdown(importContent, `${row.slug}.md`, { activePack: screenConfig.activePack }).frontmatter)).tier;
+  const importOptions = { ...source, noEmbed: true, remote: false, preserveGateMarkers: true, overrideTier, activePack: screenConfig.activePack, filename: basename(p.sourcePath).replace(/\.mdx?$/i, ''), sourcePath: p.sourcePath, allowEmptyOverwrite: true };
   return { observedRevision: snapshot?.revision ?? null, noop: ready.noop && !fileChanges && !moved, contentUnchanged: ready.noop && !fileChanges && !moved,
     trust: await ownerImportTrust(engine, row, ready.parsedPage.frontmatter, p.sourcePath), deferEmbedding: p.noEmbed, ...(moved ? { additionalPageKeys: [{ sourceId: row.source_id, slug: moved.slug }] } : {}),
     ...(fileChanges ? { file: { root, path: target, content: bytes, expectedBeforeHash: p.beforeHash,
@@ -371,10 +380,11 @@ export async function prepareManagedFileRepairMutation(engine: BrainEngine, row:
       await applied.apply(tx);
       await tx.executeRaw('UPDATE pages SET source_path=$3 WHERE source_id=$1 AND slug=$2 AND source_path IS DISTINCT FROM $3', [row.source_id, row.slug, p.sourcePath]);
       if (!applied.noop) { await project(tx); await sealPageTextProjection(tx, row.slug, row.source_id); }
-      const holdCleared = await clearGitHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: p.path, observedAt: new Date().toISOString() });
-      const [page] = await tx.executeRaw<{ id: number }>('SELECT id FROM pages WHERE source_id=$1 AND slug=$2', [row.source_id, row.slug]);
-      if (page) await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(page.id), origin: p.sourcePath,
-        raw_sha256: sha256(importContent), gbrain_version: VERSION });
+      const holdCleared = await clearGitHold(tx, { sourceId: row.source_id, incarnation: row.source_incarnation, path: p.path, observedAt: p.holdObservedAt ?? new Date().toISOString() });
+      // #6712 PR 1: the record names what is on disk now (the approved bytes), the page revision they produced and the parser, so the next discovery prescreens the file.
+      const page = await tx.readPageSnapshot(row.slug, { ...source, includeDeleted: true });
+      if (page && page.page.deleted_at == null) await recordSyncImportProvenance(tx, { source_id: row.source_id, incarnation: row.source_incarnation, page_id: Number(page.page.id), origin: p.sourcePath,
+        raw_sha256: sha256(importContent), gbrain_version: VERSION, revision: page.revision, parser: syncImportParserFor(p.sourcePath, screenConfig.packIdentity), ...syncDiskProvenance(bytes, null) });
       return { status: moved ? 'renamed' : applied.noop ? 'skipped' : snapshot ? 'updated' : 'created', slug: row.slug, source_id: row.source_id,
         chunks: applied.result.chunks, imported_file: true, file_repaired: fileChanges, hold_cleared: holdCleared, ...(moved ? { renamed_from: moved.slug } : {}),
         ...(fenceRepair ? { fence_repair: fenceRepair } : {}), ...(contentRepair ? { content_repair: contentRepair } : {}) };

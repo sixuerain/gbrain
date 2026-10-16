@@ -231,6 +231,24 @@ import { v227 } from './v227-write-gate.ts';
 import { v228 } from './v228-memory-purge.ts';
 import { v229 } from './v229-trust-allow-rules.ts';
 import { v230 } from './v230-trust-generation.ts';
+import { v231 } from './v231-fact-purge-lookup-indexes.ts';
+import { v232 } from './v232-fts-cjk-boundary.ts';
+import { v233 } from './v233-oauth-client-registered-via.ts';
+import { v234 } from './v234-persistence-git-durability.ts';
+import { v235 } from './v235-pinned-questions.ts';
+import { v236 } from './v236-open-loops-counterparty-source.ts';
+import { v237 } from './v237-facts-question-recall-indexes.ts';
+import { v238 } from './v238-persistence-client-request-id.ts';
+import { v239 } from './v239-extract-rollup-halt-reasons.ts';
+import { v240 } from './v240-pages-name-lookup-indexes.ts';
+import { v241 } from './v241-persistence-request-slug-intent-index.ts';
+import { v242 } from './v242-extract-atoms-partial-input.ts';
+import { v243 } from './v243-persistence-consumer-process-start.ts';
+import { v244 } from './v244-chunk-projected-spans.ts';
+import { v245 } from './v245-page-search-vector-bounded-timeline.ts';
+import { v246 } from './v246-page-embedding-budget.ts';
+import { v247 } from './v247-page-extraction-state.ts';
+import { v248 } from './v248-segmented-page-storage.ts';
 
 // Array order is historical (see HISTORICAL_ARRAY_ORDER in the generator); the
 // runner sorts by version before applying.
@@ -460,4 +478,22 @@ export const MIGRATIONS: Migration[] = [
   v228,
   v229,
   v230,
+  v231,
+  v232,
+  v233,
+  v234,
+  v235,
+  v236,
+  v237,
+  v238,
+  v239,
+  v240,
+  v241,
+  v242,
+  v243,
+  v244,
+  v245,
+  v246,
+  v247,
+  v248,
 ];

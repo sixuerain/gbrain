@@ -215,6 +215,10 @@
       },
       {
         "category": "ops",
+        "name": "provider_consent"
+      },
+      {
+        "category": "ops",
         "name": "harness_wiring"
       },
       {
@@ -228,6 +232,10 @@
       {
         "category": "brain",
         "name": "pglite_scratch_probe"
+      },
+      {
+        "category": "ops",
+        "name": "ipc_socket_path"
       },
       {
         "category": "brain",
@@ -247,6 +255,34 @@
       },
       {
         "category": "ops",
+        "name": "persistence_capacity"
+      },
+      {
+        "category": "ops",
+        "name": "persistence_terminal_failures"
+      },
+      {
+        "category": "ops",
+        "name": "managed_sync_not_moving"
+      },
+      {
+        "category": "ops",
+        "name": "persistence_compaction"
+      },
+      {
+        "category": "ops",
+        "name": "serve_build_drift"
+      },
+      {
+        "category": "meta",
+        "name": "schema_pack_consistency"
+      },
+      {
+        "category": "brain",
+        "name": "embedding_state"
+      },
+      {
+        "category": "ops",
         "name": "pgvector"
       },
       {
@@ -259,7 +295,7 @@
       },
       {
         "category": "ops",
-        "name": "persistence_capacity"
+        "name": "persistence_counter_drift"
       },
       {
         "category": "brain",
@@ -330,6 +366,18 @@
         "name": "embedding_migration_state"
       },
       {
+        "category": "brain",
+        "name": "embedding_identity_unqualified"
+      },
+      {
+        "category": "brain",
+        "name": "supersession_calibration"
+      },
+      {
+        "category": "brain",
+        "name": "fact_admission_floors"
+      },
+      {
         "category": "ops",
         "name": "chat_fallback_chain"
       },
@@ -395,6 +443,10 @@
       },
       {
         "category": "ops",
+        "name": "lost_caller_writes"
+      },
+      {
+        "category": "ops",
         "name": "persistence_session_timeouts"
       },
       {
@@ -415,6 +467,10 @@
       },
       {
         "category": "brain",
+        "name": "foreign_ownership_marker"
+      },
+      {
+        "category": "brain",
         "name": "unbound_source"
       },
       {
@@ -431,11 +487,19 @@
       },
       {
         "category": "ops",
+        "name": "keyword_plan"
+      },
+      {
+        "category": "ops",
         "name": "stale_embedding_effects"
       },
       {
         "category": "ops",
         "name": "google_file_modes"
+      },
+      {
+        "category": "ops",
+        "name": "google_calendar_readable"
       },
       {
         "category": "brain",
@@ -460,6 +524,14 @@
       {
         "category": "brain",
         "name": "ontology_facts_fenced"
+      },
+      {
+        "category": "ops",
+        "name": "stale_frontmatter_keys"
+      },
+      {
+        "category": "ops",
+        "name": "maintenance_write_drift"
       },
       {
         "category": "brain",
@@ -508,6 +580,10 @@
       {
         "category": "brain",
         "name": "oversized_pages"
+      },
+      {
+        "category": "brain",
+        "name": "partial_embedding"
       },
       {
         "category": "brain",
@@ -607,6 +683,10 @@
       },
       {
         "category": "brain",
+        "name": "image_embedding_coverage"
+      },
+      {
+        "category": "brain",
         "name": "sync_freshness"
       },
       {
@@ -652,6 +732,10 @@
       {
         "category": "brain",
         "name": "git_convergence"
+      },
+      {
+        "category": "brain",
+        "name": "tracked_ownership_marker"
       },
       {
         "category": "ops",
@@ -719,10 +803,6 @@
       },
       {
         "category": "ops",
-        "name": "managed_sync_not_moving"
-      },
-      {
-        "category": "ops",
         "name": "two_consumers_on_host"
       },
       {
@@ -732,6 +812,22 @@
       {
         "category": "ops",
         "name": "host_identity_mismatch"
+      },
+      {
+        "category": "brain",
+        "name": "extract_atoms_held_failed"
+      },
+      {
+        "category": "brain",
+        "name": "extraction_input_truncated"
+      },
+      {
+        "category": "brain",
+        "name": "ghost_pages"
+      },
+      {
+        "category": "brain",
+        "name": "missing_recorded_files"
       },
       {
         "category": "brain",

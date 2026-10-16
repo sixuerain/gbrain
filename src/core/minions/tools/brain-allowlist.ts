@@ -22,6 +22,7 @@
  * level; repeats re-derive the same embedding over identical content.
  */
 
+import { budgetedPageRead } from './read-budget.ts';
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { operations } from '../../operations.ts';
@@ -174,6 +175,8 @@ export interface BuildBrainToolsOpts {
   sourceId?: string;
   /** Current remote owner grant; never populated from caller tool arguments. */
   delegatedAuth?: Pick<AuthInfo, 'clientId' | 'scopes' | 'sourceId' | 'allowedSources' | 'allowedOperations'>;
+  /** #6297: byte budget on this job's get_page results (SubagentHandlerData.read_budget_bytes); unset = none. */
+  readBudgetBytes?: number;
 }
 
 interface OpContextDeps {
@@ -279,11 +282,14 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
         // model instead of crashing inside the handler, and `since: ""` never
         // reaches a handler raw.
         const params = normalizeOptionalParams(op, raw);
+        // #6297: a subagent's full-content read returns the round-trip fields only, not the body twice.
+        if (op.name === 'get_page' && params.include_content === true) params.content_only = true;
         const validationError = validateParams(op, params);
         if (validationError) throw new Error(`${toolName}: ${validationError}`);
         const output = await op.handler(opCtx, params);
         const rejection = op.name === 'put_page' ? putPageRejection(output) : null;
         if (rejection) throw new Error(rejection);
+        if (op.name === 'get_page' && opts.readBudgetBytes) return budgetedPageRead(ctx.engine, ctx.jobId, opts.readBudgetBytes, params.slug, output);
         return output;
       },
     };

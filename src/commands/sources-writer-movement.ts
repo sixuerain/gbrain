@@ -55,8 +55,7 @@ normally), held (advanced only by holds; the hold kind's repair route is printed
 Exit 1 with code managed_sync_not_moving for not_moving and parked; 0 otherwise.
 Run it after restarting serve and the workers: gbrain sources writer movement`;
 
-/** The bare command `gbrain upgrade` and `gbrain post-upgrade` print for the supervisor's step (no flags, so it inherits the default window). */
-export const MOVEMENT_SUPERVISOR_STEP = 'after restarting serve and the workers, run: gbrain sources writer movement';
+export { MOVEMENT_SUPERVISOR_STEP } from './movement-step.ts';
 
 export const MOVEMENT_DEFAULT_MIN_MS = 300_000;
 export const MOVEMENT_BUDGET_GRACE_MS = 60_000;
@@ -141,7 +140,7 @@ export function movementReport(before: SourceMovement | undefined, after: Source
           why: 'Resumes the managed catch-up where its cursor stopped; the same command is safe to rerun in a loop.', verify }, ctx), before, after };
     case 'not_moving':
       return { source_id: id, state, exit: 1, code: 'managed_sync_not_moving', reason: 'movement_check',
-        why: `${id}: ${after.cursor ? `${after.cursor.remaining} entries pending, ` : ''}no page committed and no step advance inside the ${Math.round(windowMs / 1000)}s window while ${after.live.drain ? `a sync (pid ${after.live.drain_pid}) holds the lock` : 'a consumer is live'}; last progress ${after.last_progress_at ?? 'unknown'}.${head}`,
+        why: `${id}: ${after.cursor ? `${after.cursor.remaining} entries pending, ` : ''}no page committed and no step advance inside the ${Math.round(windowMs / 1000)}s window while ${after.live.drain ? after.live.drain_job_id !== null && after.live.drain_pid === null ? `sync job #${after.live.drain_job_id} is draining it` : `a sync (pid ${after.live.drain_pid}) holds the lock` : 'a consumer is live'}; last progress ${after.last_progress_at ?? 'unknown'}.${head}`,
         fix: renderAction({ ...status, verify }, ctx), before, after };
   }
 }

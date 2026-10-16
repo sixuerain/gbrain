@@ -1,21 +1,25 @@
 import type { BrainEngine, ReservedConnection } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
-import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, independentGroup, publicationGroupKey, compactWriteReceipts, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues } from './journal.ts';
+import { claimableWriteSql, foregroundPrioritySql, claimGroupFollowers, claimNextLaneHead, claimNextWrite, publicationGroupKey, syncGroup, floorPreparationAttempts, hasClaimableWrite, getWriteRequestById, releaseUnpublishedClaim, renewWriteClaim, vacuumPersistenceQueues, independentGroup, sweepSegmentStorage } from './journal.ts';
 import { finishPreparationStalled, finishUnpublishedFailure, preparationAbortReason, recoverPublication, type PreparedMutation } from './coordinator.ts';
 import { localHostId } from './identity.ts';
 import { executeClaimedGroup, PAGE_BATCH_GROUP_MAX, publishSingleWrite, singleWrite } from './group-publish.ts';
 import { preparationConfigView } from './config-snapshot.ts';
-import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
-import { claimPhaseStamp, claimStateOf, claimTripleText, EXPIRED_PREPARING_CHARGE_SQL, enterClaimPhase, startClaimPhase, type ClaimPhaseClock, type WaitingOn } from './claim-phase.ts';
+import { CLAIM_LOST, DEFAULT_CLAIM_LEASE_TIMING, endLostLease, holdClaimForPublication, startClaimLease, type ClaimLeaseTiming } from './claim-lease.ts';
+import { claimOwnerProvablyDead, claimPhaseStamp, claimStateOf, claimTripleText, EXPIRED_PREPARING_CHARGE_SQL, enterClaimPhase, startClaimPhase, type ClaimPhaseClock, type WaitingOn } from './claim-phase.ts';
 import { DEFAULT_PREPARATION_POLICY, preparationBudgetMs, preparationKind, startPreparation, type PreparationPolicy } from './preparation-budget.ts';
 import { isTerminal, type WriteRequest } from './model.ts';
 import { ownerExceptionLogText } from './publication-failure.ts';
 import { refreshManagedFilesystemRoots } from './filesystem-guard.ts';
 import { PROJECTION_RETRY_READY_SQL, rebuildPendingPageProjections } from '../page-state/projections.ts';
+import { rebuildPendingSegmentedProjections } from '../page-body/projection.ts';
 import { publicationConcurrency } from './pool-capacity.ts';
 import { claimedHeadOrder } from './sync-window.ts';
 import { laneClaim, laneOf, laneRoots, laneTask } from './sync-lanes.ts';
 import { runPersistenceEffects } from './effects.ts';
+import { settleNoopEmbeddingEffects, type NoopSettleCursor } from './embedding-noop-settle.ts';
+import { runCompactionPass } from './compaction-pass.ts';
+import { currentEmbeddingSignature } from '../embedding.ts';
 import { PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { isWriteErrorCode } from './types.ts';
 import { redactConnectionInfo } from '../audit/redact-connection-info.ts';
@@ -30,10 +34,13 @@ import { releaseAbandonedClaims } from './effect-journal.ts';
 import { readWriteSwitchSnapshot, writeSwitchOn } from './switches.ts';
 import { consumerConnectionRoute, consumerStatementEngine, poolerExposureLine } from './consumer-lane.ts';
 import { isConnectionLoss } from '../retry-matcher.ts';
+import { INSPECT_OWNER_RETRY_MS } from './health.ts';
+import { lockOpenOsError } from './native-lock.ts';
+import { boundPublication, publicationLeaseMs, readPublicationCeilingMs, type PublicationBound } from './publication-deadline.ts';
 
 type PhaseObservation = { name: string; started_at: string; deadline_exceeded: boolean; attempt: number; first_conn_ms?: number };
 /** #5373: set by a task that abandons a still-running preparation after losing its claim; its root is freed only once `until` settles. */
-type RootHold = { until?: Promise<void> };
+type RootHold = { until?: Promise<void>; retryAfterMs?: number };
 /** #6278: the budgets and switch in effect for this tick's claims; a test may pin them through `opts.preparationBudgets`. */
 export type EffectivePreparationPolicy = PreparationPolicy & { deadlines: boolean };
 /** #6278: an abandoned preparation that outlived the hard ceiling; it pins whatever its await holds until it settles. */
@@ -42,6 +49,14 @@ export interface AbandonedPreparation { request_id: string; operation: string; s
 export const ABANDONED_STOP_GRACE_MS = 5_000;
 /** #6278: abandoned preparations past the ceiling this process tolerates before it stops claiming and reports `restart_required`. */
 export const DEFAULT_ZOMBIE_CAP = 1;
+/** An effects drain running this long names itself on stderr (serve), then again at this cadence. */
+const DRAIN_NOTICE_AFTER_MS = 5_000;
+const DRAIN_NOTICE_EVERY_MS = 10_000;
+/** #6696 C7: at most one storage.keep_db policy pass (KEEP_DB_BATCH requests) per this interval. */
+const KEEP_DB_POLICY_INTERVAL_MS = 10 * 60_000;
+/** #6650: how often a consumer looks for claims held by an owner it can prove dead. */
+export const DEAD_OWNER_SCAN_MS = 5_000;
+const yieldToEventLoop = () => new Promise<void>(resolve => setImmediate(resolve));
 /** When this process started; on PGLite no claim written earlier can belong to a live owner. */
 const PROCESS_STARTED_AT = new Date(performance.timeOrigin);
 /** #5801: the phase a connection checkout belongs to, carried through its async chain. */
@@ -52,6 +67,14 @@ const phaseScope = new AsyncLocalStorage<{ observation: PhaseObservation; starte
 function failureLogText(row: WriteRequest): string | undefined {
   const extra = ownerExceptionLogText(row.error_detail);
   return row.error_message || extra ? `${row.error_message ?? ''}${extra}`.replaceAll('"', "'") : undefined;
+}
+
+/** #6543 F1: the identity of the request a consumer line is about; control characters, spaces and quotes become `_`. */
+function requestLogFields(row: Pick<WriteRequest, 'request_id' | 'operation' | 'source_id' | 'slug' | 'principal_kind' | 'created_at'>): string {
+  const clean = (value: unknown) => String(value ?? '').replace(/[\x00-\x20"\x7f-\x9f]/g, '_').slice(0, 200);
+  const elapsed = Date.now() - new Date(row.created_at).getTime();
+  return ` request_id=${clean(row.request_id)} operation=${clean(row.operation)} source=${clean(row.source_id)} slug=${clean(row.slug)}`
+    + ` principal=${clean(row.principal_kind)}${Number.isFinite(elapsed) ? ` elapsed_ms=${Math.max(0, elapsed)}` : ''}`;
 }
 
 function errorDetail(error: unknown): string | undefined {
@@ -82,8 +105,11 @@ export async function runResidentProjectionInvocation(engine: BrainEngine, hostI
   // Advisory and bounded by the caller's signal: a probe that cannot answer
   // (for example behind a table lock) counts as a waiting write.
   const writesWaiting = publicationConcurrency(engine) > 0 && await hasClaimableWrite(engine, hostId, excludeRoots, signal).catch(() => true);
-  return rebuildPendingPageProjections(engine, writesWaiting ? WRITE_WAITING_PROJECTION_PAGES : RESIDENT_PROJECTION_PAGES,
-    { deadlineMs: RESIDENT_PROJECTION_BUDGET_MS, now, retryCooldown: true });
+  const pages = writesWaiting ? WRITE_WAITING_PROJECTION_PAGES : RESIDENT_PROJECTION_PAGES;
+  // Wave B: queued segmented pages are rebuilt first, through their own route (one segment batch at a time).
+  const startedAt = now();
+  await rebuildPendingSegmentedProjections(engine, pages, { deadlineMs: RESIDENT_PROJECTION_BUDGET_MS, now });
+  return rebuildPendingPageProjections(engine, pages, { deadlineMs: Math.max(0, RESIDENT_PROJECTION_BUDGET_MS - (now() - startedAt)), now, retryCooldown: true });
 }
 
 const PARKED_WORKER: Promise<void> = Promise.resolve();
@@ -140,6 +166,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private nextDelayMs: number | undefined;
   private topologyRetryAfter = new Map<string, number>();
   private idleLane: { conn: ReservedConnection; release: () => Promise<void> } | undefined;
+  /** #6352 (P4.6): the one lane reservation in flight; concurrent callers await it instead of reserving again. */
+  private idleLanePending: Promise<ReservedConnection | undefined> | undefined;
   private idleLaneRetryAt = 0;
   /** Phase 4.4: a single write is publishing or admitting on the idle lane's connection. */
   private laneInUse = false;
@@ -152,6 +180,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private abandoned = new Map<Promise<void>, number>();
   /** #6278: abandoned preparations past the ceiling, by request row id. */
   private zombies = new Map<string, AbandonedPreparation>();
+  /** #6288 (P2.3): publications past the ceiling, its grace and the settle window; any one makes this owner report restart_required. */
+  private stuckPublications = new Map<string, { request_id: string; stuck_at: string }>();
   private policy: EffectivePreparationPolicy = { ...DEFAULT_PREPARATION_POLICY, deadlines: true };
   private activeRoots = new Set<string>();
   /** #5984 Phase 4.5: active roots whose only task is a foreground write publishing beside this process's lane groups. */
@@ -166,10 +196,18 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   /** Requests this consumer claimed ahead of a queued sync row of their root. */
   private passedSync = new Set<string>();
   private rootRetryAfter = new Map<string, number>();
+  private deadOwnerScanAt = 0;
+  /** #6650: the dead owners (`deadOwnerClaims`) an idle tick found, handed to that tick's expired-claim reclaim. */
+  private deadOwnersSeen: string[] | null = null;
   private projectionWorker: Promise<unknown> | undefined;
   private effectsWorker: Promise<void> | undefined;
+  private draining: { since: number; settled: number; ran: number; noticedAt: number } | undefined;
+  private settleCursor: NoopSettleCursor | undefined;
   private topologyWorker: Promise<unknown> | undefined;
   private maintenanceWorker: Promise<unknown> | undefined;
+  /** #6696 C7: the storage.keep_db policy pass (resident owners only, at most one per KEEP_DB_POLICY_INTERVAL_MS while idle). */
+  private keepDbWorker: Promise<unknown> | undefined;
+  private nextKeepDb = 0;
   private nextMaintenance = 0;
   private publishedSinceMaintenance = 0;
   private maintenanceVolume = 50;
@@ -186,6 +224,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private unobserveCheckout: (() => void) | undefined;
   private phaseAttempts = 0;
   private lastLog: { key: string; at: number } | undefined;
+  private readonly requestLogs = new Map<string, number>();
   private lastPhaseError: string | undefined;
   private preparationAttempts = 0;
   private preparing = new Map<string, { request_id: string; started_at: string; deadline_exceeded: boolean; attempt: number }>();
@@ -207,7 +246,11 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       /** #6278 test seam: pins budgets, ceiling, attempt limit or the switch over the brain's config. */
       preparationBudgets?: Partial<EffectivePreparationPolicy>;
       /** #6278: abandoned preparations past the ceiling before this process stops claiming (default DEFAULT_ZOMBIE_CAP). */
-      zombieCap?: number } = {}) {
+      zombieCap?: number;
+      /** Write the long-drain progress line on stderr (serve; never a CLI command that may print --json). */
+      drainNotice?: boolean;
+      /** #6696 C7: run the storage.keep_db policy (repair/keep-db-policy.ts) for the sources this host owns while idle. */
+      keepDbPolicy?: boolean } = {}) {
     this.hostId = opts.hostId ?? localHostId();
     this.statements = consumerStatementEngine(engine);
   }
@@ -310,34 +353,45 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
    */
   private async acquireIdleLane(signal?: AbortSignal, forPublication = false): Promise<ReservedConnection | undefined> {
     if (this.idleLane) return this.idleLane.conn;
-    if (this.engine.kind !== 'postgres' || this.stopping || Date.now() < this.idleLaneRetryAt) return undefined;
-    const pool = (this.engine as { getPoolDiagnostics?: () => { poolMax: number | null; tracked: Record<string, number> } | null }).getPoolDiagnostics?.();
-    // Only reserve from an otherwise idle pool: a saturated pool falls back to a cancellable pooled probe.
-    // A single write's publication (Phase 4.4) also reserves it while at least two other connections stay free.
-    const inUse = Object.values(pool?.tracked ?? {}).reduce((sum, count) => sum + Math.max(0, count), 0);
-    if (!pool?.poolMax || pool.poolMax < 3 || (forPublication ? pool.poolMax - inUse < 3 : inUse > 0)) return undefined;
+    if (!this.idleLanePending) {
+      if (this.engine.kind !== 'postgres' || this.stopping || Date.now() < this.idleLaneRetryAt) return undefined;
+      const pool = (this.engine as { getPoolDiagnostics?: () => { poolMax: number | null; tracked: Record<string, number> } | null }).getPoolDiagnostics?.();
+      // Only reserve from an otherwise idle pool: a saturated pool falls back to a cancellable pooled probe.
+      // A single write's publication (Phase 4.4) also reserves it while at least two other connections stay free.
+      const inUse = Object.values(pool?.tracked ?? {}).reduce((sum, count) => sum + Math.max(0, count), 0);
+      if (!pool?.poolMax || pool.poolMax < 3 || (forPublication ? pool.poolMax - inUse < 3 : inUse > 0)) return undefined;
+      // #6352 (P4.6) single flight: a second caller (the probe beside a single write's publication) joins the one
+      // reservation in flight instead of reserving a second connection nobody would track or release.
+      this.idleLanePending = this.reserveIdleLane().finally(() => { this.idleLanePending = undefined; });
+    }
+    const aborted = Promise.withResolvers<undefined>();
+    const onAbort = () => aborted.resolve(undefined);
+    if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
+    // An aborted caller falls back to a pooled probe; the reservation stays tracked as the lane and is released by
+    // releaseIdleLane (or stop), never left to a resolver nobody holds.
+    try { return await Promise.race([this.idleLanePending, aborted.promise]); }
+    finally { signal?.removeEventListener('abort', onAbort); }
+  }
+  /** Reserves the lane; the lane is tracked the moment the connection arrives, or released at once when the consumer is stopping. */
+  private async reserveIdleLane(): Promise<ReservedConnection | undefined> {
     const held = Promise.withResolvers<void>();
     const reserved = Promise.withResolvers<ReservedConnection>();
     const done = this.engine.withReservedConnection(async conn => { reserved.resolve(conn); await held.promise; }, { route: 'ordinary' })
       .catch(error => { reserved.reject(error); });
-    const aborted = Promise.withResolvers<undefined>();
-    const onAbort = () => aborted.resolve(undefined);
-    if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
     try {
-      const conn = await Promise.race([reserved.promise, aborted.promise]);
-      if (!conn) {
-        reserved.promise.then(() => held.resolve(), () => {});
-        return undefined;
-      }
-      this.idleLane = { conn, release: async () => { held.resolve(); await done; } };
+      const conn = await reserved.promise;
+      const lane = { conn, release: async () => { held.resolve(); await done; } };
+      if (this.stopping) { await lane.release(); return undefined; }
+      this.idleLane = lane;
       return conn;
     } catch {
       this.idleLaneRetryAt = Date.now() + 60_000;
       return undefined;
-    } finally { signal?.removeEventListener('abort', onAbort); }
+    }
   }
   private async releaseIdleLane(): Promise<void> {
     if (this.laneInUse) return;
+    await this.idleLanePending;
     const lane = this.idleLane;
     this.idleLane = undefined;
     await lane?.release();
@@ -439,15 +493,22 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
         return;
       }
       if (this.stopping) return;
-      if (!work) {
+      // #6650: the idle probe sees only lapsed claims; a live-leased claim of a dead owner is looked for here, on its own cadence.
+      if (!work) this.deadOwnersSeen = await this.phase('dead_owner_claims', signal => this.deadOwnerClaims(signal, true));
+      if (!work && !this.deadOwnersSeen?.length) {
         this.nextDelayMs = this.backoff();
         if (!this.maintenanceWorker && Date.now() >= this.nextMaintenance) {
           this.nextMaintenance = Date.now() + 300_000;
           await this.phase('refresh_roots', signal => refreshManagedFilesystemRoots(this.engine,
             this.engine.kind === 'pglite' ? this.config.database_path : undefined, signal));
           // F4b: idle maintenance also refreshes stale PGLite planner statistics (a no-op on Postgres).
-          this.maintenanceWorker = compactWriteReceipts(this.engine).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
+          this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(() => maybeRefreshPlannerStats(this.engine, 'idle'))
             .catch(error => this.report(error)).finally(() => { this.maintenanceWorker = undefined; });
+        }
+        if (this.opts.keepDbPolicy && !this.opts.requestsOnly && !this.keepDbWorker && Date.now() >= this.nextKeepDb) {
+          this.nextKeepDb = Date.now() + KEEP_DB_POLICY_INTERVAL_MS;
+          this.keepDbWorker = import('../repair/keep-db-policy.ts').then(({ runKeepDbPolicy }) => runKeepDbPolicy(this.engine, { hostId: this.hostId }))
+            .catch(error => this.report(error)).finally(() => { this.keepDbWorker = undefined; });
         }
         return;
       }
@@ -482,7 +543,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     if (!this.maintenanceWorker && (Date.now() >= this.nextMaintenance || this.publishedSinceMaintenance >= this.maintenanceVolume)) {
       this.nextMaintenance = Date.now() + 60_000;
       this.publishedSinceMaintenance = 0;
-      this.maintenanceWorker = compactWriteReceipts(this.engine).then(() => vacuumPersistenceQueues(this.engine))
+      this.maintenanceWorker = runCompactionPass(this.engine, { hostId: this.hostId, notice: this.opts.drainNotice }).then(() => sweepSegmentStorage(this.engine).catch(error => this.report(error)))
+        .then(() => vacuumPersistenceQueues(this.engine))
         .then(rows => { this.maintenanceVolume = 50 + Math.ceil(rows * 0.2); }).catch(error => this.report(error))
         .finally(() => { this.maintenanceWorker = undefined; });
     }
@@ -522,15 +584,21 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
           this.report(error);
         }
       }
+      // #6650: a claim whose stamped owner this process can prove dead is reclaimed now, not when its lease
+      // (up to `publicationLeaseMs`) runs out; the statement below takes it with the same guards as an expired one.
+      const deadOwners = this.deadOwnersSeen?.length ? this.deadOwnersSeen : await this.phase('dead_owner_claims', signal => this.deadOwnerClaims(signal));
+      this.deadOwnersSeen = null;
       // #6278: a claim that expired while its owner was preparing (the kill case) counts one preparation attempt.
       await this.phase('expired_claims', signal => this.statements.executeRaw(`WITH expired AS (
         SELECT r.id FROM persistence_requests r WHERE r.state='running' AND r.recovery IS NULL
-        AND r.publication_started=false AND r.claim_expires_at<now() AND ${PERSISTENCE_PROTOCOL_PREDICATE}
+        AND r.publication_started=false AND ${PERSISTENCE_PROTOCOL_PREDICATE}
+        AND (r.claim_expires_at<now() OR r.claim_phase->>'token'=r.execution_token::text
+          AND concat_ws(':',r.claim_phase->'owner'->>'pid',r.claim_phase->'owner'->>'nonce',r.claim_phase->'owner'->>'start')=ANY($3::text[]))
         AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))
         ORDER BY r.sequence LIMIT 100 FOR UPDATE OF r SKIP LOCKED)
         UPDATE persistence_requests r SET state='queued',execution_token=NULL,claim_expires_at=NULL,
           preparation_attempts=r.preparation_attempts+CASE WHEN $2::boolean THEN ${EXPIRED_PREPARING_CHARGE_SQL('r')} ELSE 0 END
-        FROM expired WHERE r.id=expired.id`, [this.hostId, this.policy.deadlines], { signal }));
+        FROM expired WHERE r.id=expired.id`, [this.hostId, this.policy.deadlines, deadOwners], { signal }));
     }
     if (publicationConcurrency(this.engine) === 0) {
       await this.phase('capacity', signal => this.statements.executeRaw(`UPDATE persistence_requests SET blocked_reason='writer_pool_capacity'
@@ -566,6 +634,30 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     }
     await this.claimLanes();
   }
+  /**
+   * #6650: the owners (`pid:nonce:start`) of unexpired running claims on this host's roots that this process can prove dead
+   * (`claimOwnerProvablyDead`: same boot and pid namespace, pid gone or reused). The reclaim takes a claim only while
+   * its stamp of the current token still names such an owner, so a claim re-taken since this scan (a new token and
+   * stamp) is never touched. Only claims the expired-claim reclaim may take at all qualify: no recovery record and no
+   * publication started, so the dead owner's publication transaction either committed (the row is no longer
+   * `running`) or rolled back with its connection. A live owner, however slow, and an owner on another host or
+   * container keep their full lease. Postgres only, at most every `DEAD_OWNER_SCAN_MS`: PGLite admits one process
+   * and releases abandoned claims at start. An `idle` scan runs where the idle probe does (its reserved lane), so an
+   * idle pool still drains.
+   */
+  private async deadOwnerClaims(signal?: AbortSignal, idle = false): Promise<string[]> {
+    if (this.engine.kind !== 'postgres' || Date.now() - this.deadOwnerScanAt < DEAD_OWNER_SCAN_MS) return [];
+    this.deadOwnerScanAt = Date.now();
+    const lane = idle && !this.laneInUse && consumerConnectionRoute(this.engine).lane !== 'direct' ? await this.acquireIdleLane(signal) : undefined;
+    const owners = await this.probeQuery<{ key: string; owner: string }>(lane, `SELECT DISTINCT
+        concat_ws(':',r.claim_phase->'owner'->>'pid',r.claim_phase->'owner'->>'nonce',r.claim_phase->'owner'->>'start') AS key,(r.claim_phase->'owner')::text AS owner
+      FROM persistence_requests r
+      WHERE r.state='running' AND r.recovery IS NULL AND r.publication_started=false AND r.claim_expires_at>=now()
+        AND r.claim_phase->>'token'=r.execution_token::text AND r.claim_phase->'owner'->>'boot_id' IS NOT NULL
+        AND (r.worktree_id IS NULL OR EXISTS (SELECT 1 FROM persistence_worktrees w WHERE w.id=r.worktree_id AND w.owner_host_id=$1::uuid))
+      LIMIT 100`, [this.hostId], signal);
+    return owners.filter(row => claimOwnerProvablyDead({ owner: JSON.parse(row.owner) })).map(row => row.key);
+  }
   /** #5984 lanes: claims the next group heads of every open lane run in this process, up to its effective lane count. */
   private async claimLanes(): Promise<void> {
     for (const { worktreeId, run, capacity } of laneRoots()) {
@@ -592,8 +684,8 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   private track(row: WriteRequest, done: () => void, key: string): void {
     let progressed = false;
     const root: RootHold = {};
-    const task = this.executeOrGroup(row, root).then(result => { progressed = result; }).catch(error => this.report(error)).finally(() => {
-      if (!progressed) this.rootRetryAfter.set(key, Date.now() + (this.opts.pollMs ?? 250));
+    const task = this.executeOrGroup(row, root).then(result => { progressed = result; }).catch(error => this.report(error, row)).finally(() => {
+      if (!progressed) this.rootRetryAfter.set(key, Date.now() + (root.retryAfterMs ?? this.opts.pollMs ?? 250));
       else { this.progressWake = true; this.publishedSinceMaintenance++; }
       this.active.delete(task);
       // The slot is free now; the root (or lane slot) waits for an abandoned preparation so nothing on it overtakes that work.
@@ -603,11 +695,42 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     });
     this.active.add(task);
   }
-  /** Effects keep pace with publication: full batches continue without waiting for the next tick. */
+  /**
+   * Effects keep pace with publication: full batches continue without waiting for the next tick. No-op embedding
+   * effects settle in bulk first. Each batch yields to the event loop, so a long drain never holds requests back
+   * (PGLite queries resolve as one microtask chain that would otherwise starve stdin).
+   */
   private async drainEffects(): Promise<void> {
     const limit = 20;
-    while (!this.stopping && await runPersistenceEffects(this.engine, this.config,
-      { hostId: this.hostId, limit, signal: this.abort.signal }) >= limit);
+    const signature = currentEmbeddingSignature();
+    const drain = this.draining = { since: Date.now(), settled: 0, ran: 0, noticedAt: 0 };
+    try {
+      for (let done = !signature; !done && !this.stopping;) {
+        const pass = await settleNoopEmbeddingEffects(this.engine, this.hostId, signature!, this.settleCursor);
+        this.settleCursor = pass.cursor;
+        done = pass.done;
+        drain.settled += pass.settled;
+        this.drainNotice(drain);
+        if (!done) await yieldToEventLoop();
+      }
+      for (let ran = limit; ran >= limit && !this.stopping;) {
+        ran = await runPersistenceEffects(this.engine, this.config, { hostId: this.hostId, limit, signal: this.abort.signal });
+        drain.ran += ran;
+        this.drainNotice(drain);
+        if (ran >= limit) await yieldToEventLoop();
+      }
+    } finally {
+      this.draining = undefined;
+      if (drain.noticedAt) this.drainNotice(drain, true);
+    }
+  }
+  /** A drain past DRAIN_NOTICE_AFTER_MS names itself on stderr every DRAIN_NOTICE_EVERY_MS, and once when it ends (serve only). */
+  private drainNotice(drain: NonNullable<PersistenceConsumer['draining']>, done = false): void {
+    const now = Date.now();
+    if (!this.opts.drainNotice || (!done && (now - drain.since < DRAIN_NOTICE_AFTER_MS || now - drain.noticedAt < DRAIN_NOTICE_EVERY_MS))) return;
+    drain.noticedAt = now;
+    process.stderr.write(`[persistence] phase=effects_drain state=${done ? 'done' : 'running'} settled_noop_embeddings=${drain.settled} ran=${drain.ran}`
+      + ` elapsed_s=${Math.round((now - drain.since) / 1000)}; requests are served while it drains; status: gbrain sources writer status --json\n`);
   }
   foregroundCompletions(worktreeId: string): number { return this.foregroundCounts.get(worktreeId) ?? 0; }
   /** CEO-A7: this process holds the claim, so its outcome reaches waiters through `onSettled` without a read. */
@@ -620,8 +743,22 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     return isTerminal(row);
   }
   /** #6278: abandoned preparations past the ceiling have reached this process's cap; it claims nothing more until it restarts. */
-  restartRequired(): boolean { return this.zombies.size >= (this.opts.zombieCap ?? DEFAULT_ZOMBIE_CAP); }
+  restartRequired(): boolean { return this.zombies.size >= (this.opts.zombieCap ?? DEFAULT_ZOMBIE_CAP) || this.stuckPublications.size > 0; }
+  /** #6288 (P2.3): the consumer's side of `boundPublication`: the claim stamp at the ceiling, restart_required past it. */
+  private publicationBound(row: WriteRequest, ceilingMs: number, clock?: ClaimPhaseClock): PublicationBound {
+    return { ceilingMs,
+      onOverdue: () => {
+        if (clock) clock.waitingOn = 'publication_deadline';
+        this.log('publication', 'publication_deadline', `request ${row.request_id}: publishing past the ${ceilingMs} ms ceiling; on Postgres its transaction-local timeouts end it only if the server sees the transaction idle, not when the client connection is wedged`, '', row);
+      },
+      onStuck: settled => {
+        this.stuckPublications.set(row.id, { request_id: row.request_id, stuck_at: new Date().toISOString() });
+        void settled.then(() => { this.stuckPublications.delete(row.id); });
+        this.log('publication', 'restart_required', `request ${row.request_id}: the publication has not settled past the ceiling and its grace; restart this process (its root stays held until then)`, '', row);
+      } };
+  }
   status() {
+    const drain = this.draining;
     const { deadlines, syncMs, maintenanceMs, ceilingMs, maxAttempts } = this.policy;
     return { accepting: !this.stopping, active_preparations: this.active.size, active_worktrees: this.activeRoots.size,
       sampled_at: new Date().toISOString(), observation_scope: 'current_process_reset_on_restart',
@@ -633,6 +770,9 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       abandoned_preparations: this.abandoned.size,
       outlived_ceiling: [...this.zombies.values()].map(value => ({ ...value })),
       restart_required: this.restartRequired(),
+      stuck_publications: [...this.stuckPublications.values()].map(value => ({ ...value })),
+      // The effects drain in progress: since when, no-op embedding effects settled in bulk, effects run.
+      ...(drain ? { draining: { since: new Date(drain.since).toISOString(), settled_noop_embeddings: drain.settled, ran: drain.ran } } : {}),
       // #6317: which connection this consumer's statements take, and whether the ordinary pool is a transaction-mode pooler.
       connection: consumerConnectionRoute(this.engine),
       ...(this.lastError ? { last_error: { ...this.lastError } } : {}) };
@@ -692,7 +832,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     }
     finally { clearTimeout(timer); this.abort.signal.removeEventListener('abort', stop); this.phaseObservation = undefined; }
   }
-  private report(error: unknown): void {
+  private report(error: unknown, row?: WriteRequest): void {
     if (this.stopping && error === this.abort.signal.reason) return;
     if (error instanceof PhaseDeadlineError) {
       // The timer already logged deadline_exceeded for this phase: record it under the phase, hand it to onError
@@ -706,15 +846,24 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     this.lastError = { code: typeof code === 'string' && (/^[A-Z0-9]{5}$/.test(code) || isWriteErrorCode(code)) ? code : 'storage_error', at: new Date().toISOString(),
       ...(this.lastPhaseError ? { phase: this.lastPhaseError } : {}) };
     if (this.opts.onError) this.opts.onError(error);
-    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined);
+    else this.log(this.lastPhaseError ?? 'execution', this.lastError.code, errorDetail(error), this.lastPhaseError ? this.lastPhaseTiming : undefined, row);
     this.lastPhaseError = undefined;
     this.lastPhaseTiming = undefined;
   }
-  private log(phase: string, code: string, detail?: string, timing = ''): void {
+  /** #6543 F1: a line about one request is throttled per request (30 s per phase and code); other lines keep the shared throttle. */
+  private log(phase: string, code: string, detail?: string, timing = '', row?: WriteRequest): void {
     const key = `${phase}:${code}`, at = Date.now();
-    if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
-    this.lastLog = { key, at };
-    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${detail ? ` message="${detail}"` : ''}${timing}`
+    if (row) {
+      const requestKey = `${key}:${row.id}`;
+      if (at - (this.requestLogs.get(requestKey) ?? -Infinity) < 30_000) return;
+      if (this.requestLogs.size >= 256) for (const [stale, loggedAt] of this.requestLogs) if (at - loggedAt >= 30_000) this.requestLogs.delete(stale);
+      if (this.requestLogs.size >= 256) return;
+      this.requestLogs.set(requestKey, at);
+    } else {
+      if (this.lastLog && (at - this.lastLog.at < 1000 || this.lastLog.key === key && at - this.lastLog.at < 30_000)) return;
+      this.lastLog = { key, at };
+    }
+    if (!this.opts.onError) process.stderr.write(`[persistence] phase=${phase} reason=${code}${detail ? ` message="${detail}"` : ''}${timing}${row ? requestLogFields(row) : ''}`
       + '; unfinished work remains tracked; fix: gbrain sources writer status --json; docs: docs/ENGINES.md#persistence-consumer-log\n');
   }
   /** #5373: tracks work that outlived its claim until it settles; the returned promise never rejects. */
@@ -772,7 +921,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       this.zombies.set(row.id, { request_id: row.request_id, operation: row.operation, step: clock.step, waiting_on: clock.waitingOn,
         claimed_at: new Date(clock.claimedAt).toISOString(), abandoned_at: at, outlived_ceiling_at: at });
       void settled.then(() => { this.zombies.delete(row.id); });
-      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id}${claimTripleText(clock)}${this.restartRequired() ? ' restart_required' : ''}`);
+      this.log('preparation', 'ceiling_exceeded', `request ${row.request_id}${claimTripleText(clock)}${this.restartRequired() ? ' restart_required' : ''}`, '', row);
       await floorPreparationAttempts(this.statements, row.id, this.policy.maxAttempts).catch(error => this.report(error));
     });
   }
@@ -794,7 +943,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       try {
         const previous = claimStateOf({ state: 'running', claim_phase: row.previous_claim_phase, execution_token: previousToken(row.previous_claim_phase) });
         const done = await finishPreparationStalled(this.engine, row, { step: previous?.step ?? null, waiting_on: previous?.waiting_on ?? 'unknown', limit: policy.maxAttempts }, false);
-        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText({ step: previous?.step ?? null, waitingOn: previous?.waiting_on ?? 'unknown' })}`);
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText({ step: previous?.step ?? null, waitingOn: previous?.waiting_on ?? 'unknown' })}`, '', row);
         return this.settled(done);
       } finally { this.preparing.delete(row.id); this.executing.delete(row.id); }
     }
@@ -805,7 +954,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       return this.prepare(this.engine.kind === 'postgres' && singleWrite(row)
         && await writeSwitchOn(this.engine, 'single_write_group').catch(() => true) ? await preparationConfigView(this.engine) : this.engine,
       row, this.config, budget !== undefined && preparationKind(row) === 'foreground' ? signal : undefined, clock);
-    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded', `request ${row.request_id}${claimTripleText(clock)}`); } });
+    }, budget, { onDeadline: () => { observation.deadline_exceeded = true; this.log('preparation', 'deadline_exceeded', `request ${row.request_id}${claimTripleText(clock)}`, '', row); } });
     const stop = () => prep.abort({ code: 'consumer_stopping' });
     this.abort.signal.addEventListener('abort', stop, { once: true });
     const lease = startClaimLease(
@@ -821,7 +970,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       if (!lease.held || this.stopping) { await releaseUnpublishedClaim(this.statements, row, releaseReason()); return false; }
       if ((row.preparation_attempts ?? 0) + 1 >= policy.maxAttempts) {
         const done = await finishPreparationStalled(this.engine, row, stallInfo(), true);
-        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText(clock)}`);
+        this.log('preparation', 'preparation_stalled', `${failureLogText(done)}${claimTripleText(clock)}`, '', row);
         return this.settled(done);
       }
       await releaseUnpublishedClaim(this.statements, row, 'preparation_deadline', { charge: true });
@@ -846,8 +995,15 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       preparationActive = false;
       enterClaimPhase(clock, 'publishing');
       await faultPoint('consumer:prepared', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
-      const { done, settled } = await this.publishSingle(row, prepared);
-      if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', failureLogText(done));
+      const ceilingMs = await readPublicationCeilingMs(this.engine);
+      await holdClaimForPublication(lease, () => renewWriteClaim({ executeRaw: this.engine.executeRawDirect.bind(this.engine) }, row.id, row.execution_token!,
+        publicationLeaseMs(ceilingMs), undefined, claimPhaseStamp(clock, row.execution_token)));
+      const { done, settled } = await boundPublication(() => this.publishSingle(row, prepared), this.publicationBound(row, ceilingMs, clock));
+      if (done.state === 'failed') this.log('publication', done.error_code ?? 'storage_error', failureLogText(done), '', row);
+      if (done.state === 'queued' && done.blocked_reason === 'writer_lock_unavailable') {
+        root.retryAfterMs = INSPECT_OWNER_RETRY_MS;
+        this.log('publication', 'writer_lock_unavailable', `request ${row.request_id}: this process cannot open source ${row.source_id}'s worktree lock${lockOpenOsError(row.worktree_id) ? ` (${lockOpenOsError(row.worktree_id)})` : ''}; left for an owner process`, '', row);
+      }
       if (done.state === 'committed' && row.worktree_id && !String(row.intent?.kind).startsWith('managed_sync_')) {
         this.foregroundCounts.set(row.worktree_id, this.foregroundCompletions(row.worktree_id) + 1);
       }
@@ -867,7 +1023,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       const current = await getWriteRequestById(this.engine, row.id);
       if (current && !isTerminal(current) && current.execution_token === row.execution_token && !current.recovery) {
         const done = await finishUnpublishedFailure(this.engine, current, error, preparationActive ? 'preparation' : 'publication');
-        if (done.state === 'failed') this.log(preparationActive ? 'preparation' : 'publication', done.error_code ?? 'storage_error', failureLogText(done));
+        if (done.state === 'failed') this.log(preparationActive ? 'preparation' : 'publication', done.error_code ?? 'storage_error', failureLogText(done), '', row);
         return this.settled(done);
       }
       throw error;
@@ -879,18 +1035,15 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
   }
   /** #5984: a claimed bulk sync head takes its directly following group members along; one row runs the single path. */
   private async executeOrGroup(row: WriteRequest, root: RootHold): Promise<boolean> {
-    // #5984 admit-ahead: a window group whose predecessor did not commit is cancelled, never published after it.
-    // A lane group may be claimed while its predecessor still publishes; its commit wait decides instead.
-    // A bulk-sync group member released mid-group follows the member before it, not only the previous group (#6153 class).
+    // #6712: a page publishes whatever its predecessor's fate; a lane group member released mid-group only waits while the
+    // member before it is still unfinished (#6153 class).
     const lane = laneOf(row);
-    const order = await claimedHeadOrder(this.engine, row, lane !== null);
-    if (order === 'wait') { await releaseUnpublishedClaim(this.statements, row, 'group_member_waiting'); return false; }
-    if (order) { for (const done of order) this.settled(done); return true; }
+    if (await claimedHeadOrder(this.engine, row, lane !== null) === 'wait') { await releaseUnpublishedClaim(this.statements, row, 'group_member_waiting'); return false; }
     const group = publicationGroupKey(row);
     // A managed import batch also groups on PGLite: its members share one transaction's guards there too.
     if (!group || this.engine.kind !== 'postgres' && !group.startsWith('import:')) return this.execute(row, root);
     // #6007: a put_pages or import batch publishes in groups of at most PAGE_BATCH_GROUP_MAX pages.
-    const followers = await claimGroupFollowers(this.engine, row, group, independentGroup(group) ? PAGE_BATCH_GROUP_MAX - 1 : 63);
+    const followers = await claimGroupFollowers(this.engine, row, group, syncGroup(group) ? 63 : PAGE_BATCH_GROUP_MAX - 1);
     if (!followers.length && !lane) return this.execute(row, root);
     const rows = [row, ...followers];
     for (const member of rows) this.executing.add(member.id);
@@ -898,6 +1051,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
       return await executeClaimedGroup(this.engine, rows, { hostId: this.hostId, lane,
         prepare: (member, engine, signal, clock) => this.prepare(engine, member, this.config, signal, clock),
         lease: this.leaseTiming(), policy: this.policy, foregroundMs: this.opts.preparationMs ?? 30_000,
+        publication: this.publicationBound(row, await readPublicationCeilingMs(this.engine)),
         leftRunning: (work, blocksRoot, abandoned) => {
           if (!blocksRoot) { this.keepUntilSettled(work); return; }
           // #6278: an abandoned member blocks its root until it settles or the ceiling passes; several abandoned members all hold it.
@@ -935,6 +1089,7 @@ export class PersistenceConsumer implements PersistenceConsumerLike {
     await this.effectsWorker;
     await this.topologyWorker;
     await this.maintenanceWorker;
+    await this.keepDbWorker;
     this.unobserveCheckout?.();
     this.unobserveCheckout = undefined;
     try { this.loopDelay?.disable(); } catch { /* fail-open */ }

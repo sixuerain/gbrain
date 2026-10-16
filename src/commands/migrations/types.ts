@@ -74,6 +74,12 @@ export interface Migration {
   preview?: (opts: OrchestratorOpts) => Promise<unknown>;
   reconcile?: boolean;
   /**
+   * #6466: brain-level DB config key whose explicit off value declines this
+   * migration (`./opt-out.ts`): the runner skips it, reconcile included,
+   * lists it `declined`, and refuses an explicit `--migration <v>`.
+   */
+  optOut?: { key: string };
+  /**
    * Consent effects the orchestrator performs (agent operator contract A4);
    * apply-migrations asks for them before running it. `persistent_install`
    * is skipped (and not asked) under --no-autopilot-install or on PGLite.
@@ -88,4 +94,11 @@ export interface Migration {
    * migration is proven by test/migrations-fresh-install-audit.serial.test.ts.
    */
   fresh_install_noop?: true;
+  /**
+   * The orchestrator opens the brain only through `connectMigrationEngine`
+   * (`./run-engine.ts`) and calls `releaseRunEngine` before any `gbrain` child
+   * that needs the brain, so consecutive flagged migrations of one run share
+   * one PGLite open.
+   */
+  sharesRunEngine?: true;
 }

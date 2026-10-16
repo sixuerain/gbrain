@@ -24,8 +24,14 @@
 import type { BrainEngine } from '../engine.ts';
 import { normalizeAlias } from '../search/alias-normalize.ts';
 import { foldNonDecomposingLatin } from '../latin-fold.ts';
-import { isUndefinedTableError } from '../utils.ts';
+import { slugifySegment } from '../sync.ts';
+
+/** Lazy: the mentions graph stays out of the OpenClaw plugin's static import graph. */
+const siblingCanonical: typeof import('../mentions/siblings.ts').siblingCanonical = async (...args) =>
+  (await import('../mentions/siblings.ts')).siblingCanonical(...args);
+import { isMissingSchemaObject } from '../utils.ts';
 import { privatePagesFilterFragment } from '../search/private-visibility.ts';
+import { rankingLinkSql } from '../link-ranking-policy.ts';
 
 /**
  * Canonicalize a free-form entity reference to a page slug.
@@ -43,8 +49,9 @@ import { privatePagesFilterFragment } from '../search/private-visibility.ts';
  *      hyphen-collapse. NOT prefixed with a directory — caller decides
  *      whether to prefix `people/`, `companies/`, etc.
  *
- * Returns null when raw is empty or whitespace-only. Non-empty input always
- * produces a non-null slug — the fallback path is the floor.
+ * Returns null when raw is empty, whitespace-only, or holds no letter or
+ * number (the fallback would mint an empty slug). Any other input produces a
+ * non-null slug: the fallback path is the floor.
  */
 export async function resolveEntitySlug(
   engine: BrainEngine,
@@ -106,13 +113,20 @@ export async function resolveEntitySlug(
  * corrupts a well-formed slug (`people/alice-example` → `people-alice-example`)
  * into one no page can ever have — and the flattened slug never resolves, so
  * every re-extraction re-mints it. Path-shaped input is slugified PER SEGMENT
- * (identity for already-well-formed slugs); display names keep plain slugify.
+ * (identity for already-well-formed slugs).
+ *
+ * #6691: a segment whose letters the ASCII slugify would delete (Cyrillic,
+ * CJK, any non-Latin script) takes the page-slug grammar sync mints
+ * (`slugifySegment`), so `Мария` lands on `мария`, not `''`. Latin names keep
+ * the ASCII form (`o-brien`, `soren`). Null when nothing is left.
  */
-function fallbackSlugify(trimmed: string): string {
-  if (trimmed.includes('/')) {
-    return trimmed.split('/').map(slugify).filter(Boolean).join('/');
-  }
-  return slugify(trimmed);
+function fallbackSlugify(trimmed: string): string | null {
+  const slug = trimmed.split('/').map(fallbackSegment).filter(Boolean).join('/');
+  return slug || null;
+}
+
+function fallbackSegment(segment: string): string {
+  return /[\p{L}\p{N}]/u.test(foldForSlug(segment).replace(/[a-z0-9]/g, '')) ? slugifySegment(segment) : slugify(segment);
 }
 
 const IDENTITY_TYPES = new Set(['person', 'company', 'fund', 'organization']);
@@ -173,9 +187,9 @@ async function tryAliasExact(engine: BrainEngine, source_id: string, raw: string
       [source_id, [...new Set(hits.map((h) => h.slug))]],
     );
     const live = [...new Set(rows.map((r) => r.slug))];
-    return live.length === 1 ? live[0] : null;
+    return live.length === 1 ? live[0] : await siblingCanonical(engine, source_id, live);
   } catch (err) {
-    if (!isUndefinedTableError(err) && !aliasExactWarned) {
+    if (!isMissingSchemaObject(err, 'table', 'page_aliases') && !aliasExactWarned) {
       aliasExactWarned = true;
       console.error(`[gbrain] alias-exact resolution degraded (falling through to fuzzy): ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -277,7 +291,10 @@ export async function resolveEntitySlugWithSource(
   const aliased = await tryAliasExact(engine, source_id, trimmed);
   if (aliased) return { slug: aliased, source: 'alias_exact' };
 
-  if (basenames.length > 1) return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+  if (basenames.length > 1) {
+    const sibling = await siblingCanonical(engine, source_id, basenames.map(b => b.slug));
+    return sibling ? { slug: sibling, source: 'fuzzy_match' } : fallbackResult(trimmed);
+  }
 
   if (isBareName(trimmed)) {
     const expanded = await tryUnambiguousPrefixExpansion(engine, source_id, trimmed);
@@ -287,7 +304,12 @@ export async function resolveEntitySlugWithSource(
     if (fuzzy) return { slug: fuzzy, source: 'fuzzy_match' };
   }
 
-  return { slug: fallbackSlugify(trimmed), source: 'fallback_slugify' };
+  return fallbackResult(trimmed);
+}
+
+function fallbackResult(trimmed: string): ResolveResult | null {
+  const slug = fallbackSlugify(trimmed);
+  return slug ? { slug, source: 'fallback_slugify' } : null;
 }
 
 /**
@@ -330,29 +352,39 @@ export async function resolveStrictEntityReference(
       WHERE p.source_id = $1 AND p.deleted_at IS NULL AND p.slug = ANY($2::text[]) ${privacy}`,
     [source_id, [...new Set(slugs)]],
   );
-  const pick = (rows: Array<{ slug: string; type: string | null }>, arm: StrictResolutionArm): StrictResolution | null => {
-    if (rows.length > 1) return { slug: null, miss: 'ambiguous' };
+  // The source pack's linkable entity types (accounts, CRM records, ...) are fact entities too.
+  let linkable: Set<string> | null = null;
+  const isEntity = async (r: { slug: string; type: string | null }) => {
+    if (isFactEntityPage(r.slug, r.type)) return true;
+    linkable ??= new Set((await (await import('../mentions/policy.ts')).loadLinkableTypes(engine, source_id).catch(() => ({ types: [] as string[] }))).types);
+    return r.type != null && linkable.has(r.type);
+  };
+  const pick = async (rows: Array<{ slug: string; type: string | null }>, arm: StrictResolutionArm): Promise<StrictResolution | null> => {
+    if (rows.length > 1) {
+      const sibling = await siblingCanonical(engine, source_id, rows.map(r => r.slug), { excludePrivate: opts.excludePrivate });
+      return sibling ? { slug: sibling, arm } : { slug: null, miss: 'ambiguous' };
+    }
     if (rows.length === 0) return null;
-    return isFactEntityPage(rows[0].slug, rows[0].type) ? { slug: rows[0].slug, arm } : { slug: null, miss: 'not_entity' };
+    return await isEntity(rows[0]) ? { slug: rows[0].slug, arm } : { slug: null, miss: 'not_entity' };
   };
 
   if (looksLikeSlug(trimmed)) {
-    const exact = pick(await live([trimmed]), 'exact_page');
+    const exact = await pick(await live([trimmed]), 'exact_page');
     if (exact) return exact;
   }
   const token = slugify(trimmed);
   if (!trimmed.includes('/') && token.includes('-')) {
-    const basename = pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
+    const basename = await pick(await live([...PREFIX_EXPANSION_DIRS, 'concepts'].map(dir => `${dir}/${token}`)), 'basename');
     if (basename) return basename;
   }
   const norm = normalizeAlias(trimmed);
   if (norm) {
     try {
       const hits = (await engine.resolveAliases([norm], { sourceId: source_id })).get(norm) ?? [];
-      const aliased = pick(await live(hits.map(h => h.slug)), 'alias_exact');
+      const aliased = await pick(await live(hits.map(h => h.slug)), 'alias_exact');
       if (aliased) return aliased;
     } catch (err) {
-      if (!isUndefinedTableError(err)) throw err;
+      if (!isMissingSchemaObject(err, 'table', 'page_aliases')) throw err;
     }
   }
   if (opts.sameName && !isBareName(trimmed)) {
@@ -365,7 +397,7 @@ export async function resolveStrictEntityReference(
           LIMIT 5`,
         [source_id, trimmed.toLowerCase(), token],
       );
-      const named = pick(rows.filter(row => isFactEntityPage(row.slug, row.type) && sameEntityName(trimmed, row.title, row.slug)), 'same_name');
+      const named = await pick(rows.filter(row => isFactEntityPage(row.slug, row.type) && sameEntityName(trimmed, row.title, row.slug)), 'same_name');
       if (named) return named;
     } catch (err) {
       if (!isMissingTrigramError(err)) throw err;
@@ -488,8 +520,8 @@ export async function findPrefixCandidates(
       connection_count: number;
     }>(
       `SELECT p.slug,
-              ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
-               + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
+              ((SELECT COUNT(*)::int FROM links l WHERE l.to_page_id = p.id AND ${rankingLinkSql('l')})
+               + (SELECT COUNT(*)::int FROM links l WHERE l.from_page_id = p.id AND ${rankingLinkSql('l')})
                + (SELECT COUNT(*)::int FROM content_chunks WHERE page_id = p.id))
                 AS connection_count
        FROM pages p
@@ -587,8 +619,8 @@ async function tryPrefixExpansion(
         // directly. Even on a pathological prefix matching 1000+ pages,
         // work is bounded per-candidate, not whole-table.
         `SELECT p.slug,
-                ((SELECT COUNT(*)::int FROM links WHERE to_page_id = p.id)
-                 + (SELECT COUNT(*)::int FROM links WHERE from_page_id = p.id)
+                ((SELECT COUNT(*)::int FROM links l WHERE l.to_page_id = p.id AND ${rankingLinkSql('l')})
+                 + (SELECT COUNT(*)::int FROM links l WHERE l.from_page_id = p.id AND ${rankingLinkSql('l')})
                  + (SELECT COUNT(*)::int FROM content_chunks WHERE page_id = p.id))
                   AS connection_count
          FROM pages p
@@ -710,17 +742,15 @@ export function slugify(raw: string): string {
   // and the sweep below would DELETE them: "Đăng Example" slugged to
   // "ang-example". Fold after the strip so composed forms reduce in one pass
   // ("ǿ" → "ø" → "o").
-  const folded = foldNonDecomposingLatin(
-    raw
-      .toLowerCase()
-      .normalize('NFKD')
-      // NFKD decomposes accents into combining marks (U+0300..U+036F);
-      // strip them before replacing the rest with hyphens so "è" → "e",
-      // not "e" + "-".
-      .replace(/[̀-ͯ]/g, ''),
-  );
-  return folded
+  return foldForSlug(raw)
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+/** Lowercase, accent marks stripped, stroke letters folded: what `slugify` keeps `[a-z0-9]` from. */
+function foldForSlug(raw: string): string {
+  // NFKD decomposes accents into combining marks (U+0300..U+036F); strip them
+  // before replacing the rest with hyphens so "è" → "e", not "e" + "-".
+  return foldNonDecomposingLatin(raw.toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, ''));
 }

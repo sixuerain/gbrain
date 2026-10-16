@@ -120,6 +120,21 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/persistence-requests.ts')).writeStallCheck(engine),
   },
   {
+    id: 'lost_caller_writes', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Replaying refused caller writes is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some caller writes (remember, put_page, add_timeline_entry) were refused at publication and never landed; the caller saw an error and the fact or edit was dropped',
+    run: async (engine, scope) => (await import('./checks/persistence-requests.ts')).lostCallerWritesCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'persistence_terminal_failures', resolution: 'operator', registration: 'doctor.ts',
+    hostOnly: 'Request ids, roots and recovery records are brain-host persistence state outside any source scope.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A write receipt that did not commit blocks work now (a recovery record or a checkpoint blocker), or an unresolved receipt is a gbrain-defect class',
+    instruction: 'Run the fix doctor prints, then drill down with `gbrain sources writer failures <source> --group-by category --json` on the brain host (docs/guides/troubleshooting.md#terminal-write-failures).',
+    run: async (engine, scope) => (await (await import('./checks/persistence-requests.ts')).terminalFailuresCheck(engine, scope.sourceIds))!,
+  },
+  {
     id: 'persistence_session_timeouts', resolution: 'operator', registration: 'wave',
     count: d => d.reason === 'session_timeouts_not_applied' ? 1 : 0,
     hostOnly: 'The connection URL and its pooler are brain-host configuration outside any source scope.',
@@ -172,6 +187,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/orphan-bindings.ts')).checkOrphanBindings(engine),
   },
   {
+    id: 'foreign_ownership_marker', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Ownership markers are private files beside the source checkouts on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'An ownership marker beside a source checkout names another brain or an unknown worktree, so claiming that checkout refuses recovery_required',
+    instruction: 'Confirm with the user that the recorded brain is retired, then remove exactly the marker file doctor names on the brain host and claim again (docs/guides/write-refusals.md#foreign-ownership-marker); never remove a marker of a brain still in use.',
+    run: async engine => (await import('./checks/orphan-bindings.ts')).checkForeignOwnershipMarkers(engine),
+  },
+  {
     id: 'unbound_source', resolution: 'operator', registration: 'wave',
     count: d => (d.sources ?? []).filter((source: { bound?: boolean }) => source.bound).reduce((sum: number, source: { pages?: number }) => sum + Number(source.pages ?? 0), 0),
     impact: 'Some pages written database-only while their source was unbound now sit outside canonical files',
@@ -184,6 +207,20 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     impact: 'A cumulative managed-write limit is at or above 80%',
     instruction: 'Raise the named journal limit with the `gbrain config set` command doctor prints, on the brain host.',
     run: async engine => (await import('./checks/persistence-capacity.ts')).checkPersistenceCapacity(engine),
+  },
+  {
+    id: 'persistence_compaction', resolution: 'operator', registration: 'doctor.ts',
+    count: d => (d.live_consumers ?? 0) > 0 ? 1 : 0,
+    impact: 'A resident consumer has not compacted write receipts within its staleness window, so receipt bytes are not coming back',
+    instruction: 'Check the consumer with `gbrain sources writer status --json`; preview an on-demand pass with `gbrain repair receipt-compaction --json` and apply it after the user agrees.',
+    run: async engine => (await import('./checks/persistence-compaction.ts')).checkPersistenceCompaction(engine),
+  },
+  {
+    id: 'persistence_counter_drift', resolution: 'operator', registration: 'doctor.ts',
+    count: d => (d.drift ?? []).length,
+    impact: 'Receipt-bytes counters differ from the receipts they account for',
+    instruction: 'Report the drift with `gbrain doctor --only persistence_counter_drift --json`; the check changes nothing.',
+    run: async engine => (await import('./checks/persistence-compaction.ts')).checkPersistenceCounterDrift(engine),
   },
   {
     id: 'parked_effects', resolution: 'operator', registration: 'doctor.ts',
@@ -221,6 +258,13 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     run: async engine => (await import('./checks/vector-plan.ts')).vectorPlanCheck(engine),
   },
   {
+    id: 'keyword_plan', resolution: 'operator', registration: 'wave',
+    count: d => (d.outcome === 'canary_timed_out' || d.outcome === 'canary_slow' ? 1 : 0),
+    impact: 'The commonest keyword term on this brain cannot be counted inside the keyword statement bound, so broad keyword queries time out and hybrid search answers from the vector arm alone',
+    instruction: 'Read the canary doctor reports (one term is not workload coverage); raise `search.keyword_statement_timeout_ms` on the brain host only to buy time (1000-60000 ms, then restart the serving process), narrow broad queries to one source (`gbrain search --source-id <id>`, MCP `source_id`), and follow #6495 for the bounded candidate set (docs/guides/troubleshooting.md#keyword-search-times-out-on-a-large-postgres-brain).',
+    run: async engine => (await import('./checks/keyword-plan.ts')).keywordPlanCheck(engine),
+  },
+  {
     id: 'stale_embedding_effects', resolution: 'repair', registration: 'wave',
     count: d => Number(d.stale_effects ?? 0),
     impact: 'A committed write still has a stale queued or failed embedding effect that blocks compaction and activation',
@@ -232,6 +276,14 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.count ?? 0),
     impact: 'Some files gbrain wrote under a Google source directory outside ~/.gbrain are readable by other local users',
     run: async (engine, scope) => (await import('./checks/google-file-modes.ts')).checkGoogleFileModes(engine, scope.sourceIds),
+  },
+  {
+    id: 'google_calendar_readable', resolution: 'operator', registration: 'wave',
+    hostOnly: 'Connector state and the account address live on the brain host.',
+    count: d => Number(d.count ?? 0),
+    impact: 'A Google source is configured with a calendar its account cannot read, so it imports no events',
+    instruction: 'List the readable calendars with `gbrain google calendars --account <email>`, then `gbrain sources set-calendar <source> <calendar-id>` and `gbrain sync --source <source>` (docs/guides/google-connect.md#unreadable-calendar).',
+    run: async (engine, scope) => (await import('./checks/google-calendar.ts')).googleCalendarReadableCheck(engine, scope.sourceIds),
   },
   {
     id: 'atom_provenance_drift', resolution: 'repair', registration: 'doctor.ts',
@@ -282,6 +334,20 @@ export const WAVE_CHECKS: readonly WaveCheckSpec[] = [
     count: d => Number(d.fenced ?? 0) + Number(d.retired ?? 0),
     impact: 'Some ontology observations were moved onto an entity page\'s Facts table, and ontology_get no longer returns the ones a later page write retired',
     run: async (engine, scope) => (await import('./checks/ontology-facts.ts')).ontologyFactsCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'stale_frontmatter_keys', resolution: 'repair', registration: 'wave',
+    hostOnly: 'Sweeping stored frontmatter keys is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0),
+    impact: 'Some pages store a parser-reserved frontmatter key (type, title, tags, slug) left by an older import; writes compare around it, the sweep is hygiene',
+    run: async (engine, scope) => (await import('./checks/frontmatter-keys.ts')).staleFrontmatterKeysCheck(engine, scope.sourceIds),
+  },
+  {
+    id: 'maintenance_write_drift', resolution: 'repair', registration: 'wave',
+    hostOnly: 'The live file check reads the canonical checkout on the brain host; resolving drift is a host-side, explicit-only repair.',
+    count: d => Number(d.count ?? 0) + Number(d.concept_skips ?? 0),
+    impact: 'Some pages have a canonical file that differs from the database, so every coordinated write to them refuses source_changed until someone resolves them',
+    run: async (engine, scope) => (await import('./checks/maintenance-drift.ts')).maintenanceWriteDriftCheck(engine, scope.sourceIds),
   },
 ];
 

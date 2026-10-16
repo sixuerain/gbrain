@@ -65,6 +65,7 @@ import { digest } from '../persistence/digest.ts';
 import { getWriteRequest } from '../persistence/journal.ts';
 import { maintenanceCallerPreflight, maintenancePreflight, submitDatabaseMaintenanceIntent, type MaintenanceAuthority } from '../persistence/prepared-maintenance.ts';
 import { resolveManagedFactsEmbedding } from '../persistence/facts-maintenance.ts';
+import { isSegmentedPage } from '../page-body/page-shape.ts';
 import { REVISION_BACKFILL_PENDING } from '../page-state/types.ts';
 import { opError, OperationError } from '../ops/contract.ts';
 import {
@@ -76,7 +77,7 @@ import {
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { fenceUnfencedFacts, planUnfencedFacts } from '../facts/unfenced-facts.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { factsFenceSection, factsFenceSections, parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
 import {
   duplicateActiveFenceRows,
   extractFactsFromFenceText,
@@ -371,11 +372,15 @@ interface FenceReconcilePlan {
 /**
  * One page's reconcile plan against its stored rows. Null when the fence is
  * not authoritative (warnings are appended): a warning-bearing parse or a
- * fence below the timeline sentinel preserves the page's existing index.
+ * fence in each section of the page (#6686: a split fence) preserves the page's existing index.
  */
 async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: string | null; timeline: string | null; effective_date?: Date | string | null },
   slug: string, sourceId: string, warnings: string[]): Promise<FenceReconcilePlan | null> {
-  const parsed = parseFactsFence(page.compiled_truth ?? '');
+  // #6686: a lone fence below the timeline sentinel that parses cleanly is the page's fence, read where the writers
+  // edit it; one that does not parse keeps the #3625 guard below.
+  const below = factsFenceSection(page) === 'timeline' ? parseFactsFence(page.timeline ?? '') : null;
+  const lone = below !== null && below.warnings.length === 0;
+  const parsed = lone ? below : parseFactsFence(page.compiled_truth ?? '');
   if (parsed.warnings.length > 0) {
     // The parser deliberately skips malformed rows and returns any rows it
     // could still recover. That partial result is not authoritative: using
@@ -386,7 +391,14 @@ async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: strin
   // #3625: a fence below the timeline sentinel lands in page.timeline, where
   // parseFactsFence cannot see it; reading compiled_truth alone would treat
   // its rows as deleted. timelineHasGenuineFactsFenceMarker explains the scan.
-  if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
+  if (!lone && timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
+    // #6686: a fence in each section (a writer added one above the sentinel) is merged by an explicit repair.
+    if (factsFenceSections(page).body) {
+      warnings.push(`${slug}: FACTS_FENCE_BELOW_SENTINEL: the page holds a ## Facts fence above the <!-- timeline --> sentinel and another below it `
+        + `(a split fence), so extract_facts leaves its indexed facts as they are. Preview merging them into one with gbrain repair split-facts --source ${sourceId}, `
+        + 'then apply the hash it prints.');
+      return null;
+    }
     warnings.push(
       `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
       `the <!-- timeline --> sentinel, where extract_facts cannot see it. ` +
@@ -664,6 +676,8 @@ export interface ExtractFactsResult {
   phantomsRedirected: number;
   phantomsAmbiguous: number;
   phantomsSkippedDrift: number;
+  /** #6650: phantoms held because they own legacy (unfenced) fact rows. */
+  phantomsHeldLegacyRows: number;
   phantomsLockBusy: boolean;
   phantomsMorePending: boolean;
 }
@@ -749,7 +763,7 @@ function timelineHasGenuineFactsFenceMarker(timeline: string): boolean {
  * slugify-floor / stub-guard-blocked slugs) are structurally unfenceable and
  * never gate.
  */
-async function pendingLegacyRows(engine: BrainEngine, sourceId: string): Promise<{ count: number; slugs: Set<string> }> {
+async function pendingLegacyRows(engine: BrainEngine, sourceId: string): Promise<Map<string, number>> {
   const legacy = await engine.executeRaw<{ entity_slug: string; n: string }>(
     `SELECT f.entity_slug, COUNT(*) AS n
        FROM facts f
@@ -772,7 +786,7 @@ async function pendingLegacyRows(engine: BrainEngine, sourceId: string): Promise
       GROUP BY f.entity_slug`,
     [sourceId],
   );
-  return { count: legacy.reduce((sum, row) => sum + parseInt(row.n ?? '0', 10), 0), slugs: new Set(legacy.map(row => row.entity_slug)) };
+  return new Map(legacy.map(row => [row.entity_slug, parseInt(row.n ?? '0', 10)]));
 }
 
 /**
@@ -809,6 +823,7 @@ export async function runExtractFacts(
     phantomsRedirected: 0,
     phantomsAmbiguous: 0,
     phantomsSkippedDrift: 0,
+    phantomsHeldLegacyRows: 0,
     phantomsLockBusy: false,
     phantomsMorePending: false,
   };
@@ -821,11 +836,13 @@ export async function runExtractFacts(
   // managed brain, the page file + maintenance transaction otherwise. The
   // fenced pages join this run's reconcile below.
   let fencedSlugs: string[] = [];
+  let unboundRefused = new Set<string>();
   if (!opts.dryRun) {
     try {
       const fence = await fenceUnfencedFacts(engine, await planUnfencedFacts(engine, { sourceId }), { pageLockRoot: opts.pageLockRoot });
       result.unfencedRowsFenced = fence.fenced;
       fencedSlugs = fence.fenced_slugs;
+      unboundRefused = new Set(fence.unbound_refused.map(page => page.slug));
       for (const page of [...fence.failed_pages, ...fence.missing_files]) result.warnings.push(`FACTS_FENCE_FAILED: ${page}`);
     } catch (e) {
       result.warnings.push(`FACTS_FENCE_FAILED: ${(e instanceof Error ? e.message : String(e)).slice(0, 300)}`);
@@ -835,19 +852,24 @@ export async function runExtractFacts(
   // ── Empty-fence guard (per page, #6278) ─────────────────────────
   // Rows the fence step could not fence this run keep their own page out of
   // the destructive reconciliation pass; the other pages reconcile.
-  const { count: legacyCount, slugs: legacySlugs } = await pendingLegacyRows(engine, sourceId);
+  // #6610: rows the unbound-source policy keeps unfenced on database-only pages stay held out of reconciliation
+  // but never gate the run; doctor fence_integrity names the opt-in that fences them.
+  const pending = await pendingLegacyRows(engine, sourceId);
+  const legacySlugs = new Set(pending.keys());
+  const gating = [...pending].filter(([slug]) => !unboundRefused.has(slug));
+  const legacyCount = gating.reduce((sum, [, n]) => sum + n, 0);
   result.legacyRowsPending = legacyCount;
-  result.legacyPages = [...legacySlugs].sort();
+  result.legacyPages = gating.map(([slug]) => slug).sort();
   if (legacyCount > 0) {
     result.guardTriggered = true;
     result.warnings.push(
-      `extract_facts: ${legacyCount} unfenced fact row(s) on ${legacySlugs.size} page(s) in source "${sourceId}" (entity page present, row_num NULL) ` +
+      `extract_facts: ${legacyCount} unfenced fact row(s) on ${gating.length} page(s) in source "${sourceId}" (entity page present, row_num NULL) ` +
       (opts.dryRun
         ? 'would be fenced by this phase; a dry run writes nothing, so those pages skip reconciliation.'
         : 'could not be fenced this run, so those pages keep their fact index and skip reconciliation while the other pages reconcile. ' +
           'The FACTS_FENCE_FAILED warnings name each page and why; ' +
-          'a page whose canonical file does not exist on this host is fenced by the cycle on the host that holds the file; ' +
-          'a row the fence codec cannot render stays active and searchable (doctor fence_integrity lists it); the phantom-redirect pass waits until the source has no unfenced rows. ' +
+          'a page whose recorded canonical file does not exist on this host is fenced by the cycle on the host that holds the file; ' +
+          'a row the fence codec cannot render stays active and searchable (doctor fence_integrity lists it); the phantom-redirect pass holds only the phantoms that own such rows. ' +
           'Individual rows can instead be drained via `forget_fact`.'),
     );
     // #3683: a guard-triggered run books its halt here for doctor
@@ -860,6 +882,7 @@ export async function runExtractFacts(
         cost_delta: 0,
         round_completed_delta: 0,
         halt_delta: 1,
+        halt_reason: 'integrity_guard',
       });
     }
   }
@@ -874,10 +897,17 @@ export async function runExtractFacts(
   // IS NOT NULL` so a half-redirected page (soft-deleted, .md still on
   // disk) won't be re-redirected.
   // #6278: the pass moves rows by their fence position and would strand a
-  // legacy row (no position) on a deleted phantom, so it still waits for the
-  // whole source to be fenced; the reconcile walk below is per page.
+  // legacy row (no position) on a deleted phantom. #6650: only the phantoms
+  // that own legacy rows are held, so one unadoptable row no longer stops
+  // the pass for the whole source. A phantom that is the provenance page of
+  // an ontology observation is held too: the move would rewrite the
+  // observation's subject and expire it.
   let phantomResult: PhantomPassResult = emptyPhantomPassResult();
-  if (opts.brainDir && legacyCount === 0) {
+  if (opts.brainDir) {
+    const holdSlugs = new Set([...legacySlugs, ...(await engine.executeRaw<{ slug: string }>(
+      `SELECT DISTINCT source_markdown_slug AS slug FROM facts
+        WHERE source_id = $1 AND dimension IS NOT NULL AND expired_at IS NULL AND source_markdown_slug NOT LIKE '%/%'`,
+      [sourceId])).map(row => row.slug)]);
     try {
       phantomResult = await runPhantomRedirectPass(
         engine,
@@ -885,6 +915,7 @@ export async function runExtractFacts(
         sourceId,
         opts.dryRun ?? false,
         opts.signal,
+        holdSlugs,
       );
     } catch (e) {
       // The pass owns its own per-phantom try/catch; reaching this catch
@@ -898,6 +929,7 @@ export async function runExtractFacts(
   result.phantomsRedirected = phantomResult.redirected;
   result.phantomsAmbiguous = phantomResult.ambiguous;
   result.phantomsSkippedDrift = phantomResult.skipped_drift;
+  result.phantomsHeldLegacyRows = phantomResult.held_legacy_rows;
   result.phantomsLockBusy = phantomResult.lock_busy;
   result.phantomsMorePending = phantomResult.more_pending;
 
@@ -980,6 +1012,10 @@ export async function runExtractFacts(
     revision = page.knowledge_revision ?? null;
     // #6259: a quarantined page projects no fence facts; its existing index is left as it is.
     if (isQuarantined(page.frontmatter as Record<string, unknown> | null)) return 'skipped';
+    if (isSegmentedPage(page)) {
+      result.warnings.push(`${slug}: FACTS_RECONCILE_SEGMENTED: the page body is stored in segments, which fence reconcile cannot read yet; its existing facts index is preserved`);
+      return 'skipped';
+    }
 
     const plan = await planFenceReconcile(engine, page, slug, sourceId, result.warnings);
     if (!plan) return 'invalid';
@@ -1134,7 +1170,7 @@ export async function runExtractFacts(
       kind: 'facts.fence',
       source_id: sourceId,
       cost_delta: 0,
-      ...classifyRunStop({ error: result.pagesFailed > 0 }),
+      ...classifyRunStop({ error: result.pagesFailed > 0 ? 'item_error' : false }),
     });
   }
 

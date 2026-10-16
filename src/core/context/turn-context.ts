@@ -187,6 +187,12 @@ export interface TurnContextResult {
    * owner's review command, never the content.
    */
   suppressed?: SuppressionSummary;
+  /**
+   * Wave 5 D5 (additive, wire back-compat): the proactive brief carried in
+   * `text`, present only when `context.proactive_brief` is on and the gate
+   * fired. The IPC delivery point logs and ledgers these items.
+   */
+  brief?: import('./proactive-brief.ts').BriefView;
 }
 
 export interface AssembleTurnContextOpts {
@@ -733,10 +739,12 @@ async function assembleDelta(
       try {
         const after = opts.factsAfter ?? (since ? { at: since, id: null } : null);
         const visibility = remote ? (['world'] as ('private' | 'world')[]) : undefined;
+        const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+        const excludePrivate = await resolveExcludePrivatePages(engine, remote ? undefined : false);
         const rows = await engine.listFactsKeyset(
           opts.sourceId,
           after ? { createdAt: after.at, id: after.id } : null,
-          { activeOnly: true, limit: DELTA_FACT_FETCH_LIMIT + 1, visibility, fingerprint: true, eligibility: { floor: policy.floor } },
+          { activeOnly: true, limit: DELTA_FACT_FETCH_LIMIT + 1, visibility, excludePrivate, fingerprint: true, eligibility: { floor: policy.floor } },
         );
         const kept = rows.slice(0, DELTA_FACT_FETCH_LIMIT);
         const probe = rows.length > DELTA_FACT_FETCH_LIMIT ? rows[DELTA_FACT_FETCH_LIMIT] : null;

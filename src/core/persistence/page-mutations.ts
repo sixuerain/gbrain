@@ -15,28 +15,32 @@ import { computeContentHash } from '../ingestion/types.ts';
 import { resolveSlugForPath } from '../sync.ts';
 import { scannerSlugRootMode, scannerSourcePath } from '../write-through.ts';
 import { sha256 } from './digest.ts';
+import { receiptReservation } from './receipt-bytes.ts';
 import { assertPersistenceAccepting, estimatedRetryAfterMs, waiterOnlyOwner, onPersistenceLane, waitForWrite, writeResponse } from './service.ts';
 import { parseWireWriteWaitMs } from './write-wait.ts';
 import { assertTimelineNotOmitted, isTimelineSection, timelineSectionOf, type TimelineSection } from './timeline-omission.ts';
 import { contentOriginTier } from '../trust/tier.ts';
+import { PAGE_MAX_BYTES } from '../page-size-policy.ts';
+import { contentSizeHold } from '../markdown.ts';
 import { throwIfHeld } from '../trust/gate-outcomes.ts';
 import { admitWrite, assertPageRequestIdentity, assertReplayIntent, getWriteRequest, intentDigest, type WriteAdmission } from './journal.ts';
 import { submissionAuthority, authorizeStoredRequest } from './authority.ts';
 import { currentVerifiedLocalWriter, localHostId, readLocalWriter, registerLocalWriter, withVerifiedLocalRegistration } from './identity.ts';
 import type { BrainEngine } from '../engine.ts';
-import { claimWorktree, getWorktreeBinding, managedPersistenceEnabled } from './ownership.ts';
-import { parseMutationPrecondition } from './preconditions.ts';
+import { claimWorktree, getWorktreeBinding } from './ownership.ts';
+import { clientRequestIdOf, parseMutationPrecondition } from './preconditions.ts';
 import { assertPurgeParams } from './purge-params.ts';
 import type { Principal, WriteRequest } from './model.ts';
 import { normalizeSubagentPageInput, undeclaredPageTypeWarning, type PageTypeWarning } from './page-input.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
-import { isUnboundSourcePage, readUnboundWritePolicy, unboundSourceError } from './unbound-source.ts';
+import { decideUnboundWrite, isUnboundSourcePage } from './unbound-source.ts';
+import { assertRestoreOrigin } from './detached-pages.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
 import { publishesDatabaseOnly } from './page-prepare.ts';
+import { materializedSnapshot } from './segmented-apply.ts';
 import { cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { isConnectorSourceKind } from './connector-identity.ts';
 
 export async function requestPrincipalForContext(ctx: OperationContext): Promise<Principal> {
   // #5994: a failed-writes replay is admitted under the original writer.
@@ -191,7 +195,7 @@ export function emitFenceNotice(ctx: Pick<OperationContext, 'emitNotice'>, respo
 const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 'managed_file_repair', 'managed_quarantine_clear']);
 
 /** #6007: a `put_pages` child: its batch, its position and the batch size are part of its identity. */
-export interface PageBatchMember { id: string; index: number; size: number; requestId: string }
+export interface PageBatchMember { id: string; index: number; size: number; requestId: string; repeats?: number[] }
 
 export async function submitPageMutation(ctx: OperationContext,
   input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection }): Promise<Record<string, unknown>> {
@@ -244,10 +248,19 @@ export async function preparePageAdmission(ctx: OperationContext,
     throw new OperationError('invalid_params', 'fence_repair is reserved for the trusted fence repair.',
       'Drop fence_repair and submit the page without it; gbrain repair fences records its own receipt on the brain host. To fix a malformed facts or takes fence, correct it in content (or write facts with remember and takes with takes_add); a held file is repaired by the brain host operator with gbrain repair fences, so ask the user to run it.');
   }
+  // A body over the page ceiling can never be admitted: refuse it as a caller error before the journal
+  // reserves intent bytes, so an oversized write never reads as retryable queue_capacity.
+  const body = input.params.content;
+  const bodyBytes = (input.operation === 'put_page' || input.operation === 'capture') && typeof body === 'string' && body.length > PAGE_MAX_BYTES / 3
+    ? Buffer.byteLength(body, 'utf-8') : 0;
+  if (bodyBytes > PAGE_MAX_BYTES) {
+    throw new OperationError('request_too_large', contentSizeHold(bodyBytes, PAGE_MAX_BYTES)!.message,
+      `Nothing was admitted or written, and the same content is refused on every retry. Pages up to ${PAGE_MAX_BYTES} bytes are stored and searchable; send a smaller page.`);
+  }
   const { page_batch: _forged, timeline_section: _section, ...params } = input.params;
   const p: Record<string, unknown> = { ...params, ...parseMutationPrecondition(params) };
   if (p.content_origin !== undefined) contentOriginTier(p.content_origin);
-  if (input.batch) p.page_batch = { id: input.batch.id, index: input.batch.index, size: input.batch.size };
+  if (input.batch) p.page_batch = { id: input.batch.id, index: input.batch.index, size: input.batch.size, ...(input.batch.repeats?.length ? { repeats: input.batch.repeats } : {}) };
   const requestId = input.batch ? input.batch.requestId : typeof p.request_id === 'string' ? p.request_id : randomUUID();
   const sourceId = pageMutationSource(ctx, p, input.operation);
   await initializeLocalPersistence(ctx);
@@ -337,7 +350,7 @@ export async function preparePageAdmission(ctx: OperationContext,
     const { applyPageEdits, assertEditRevision, parsePageEdits } = await import('./page-edit.ts');
     if (!snapshot || snapshot.page.deleted_at) throw new OperationError('page_not_found', `Page not found: ${slug}`, 'edit_page changes an existing page; create it with put_page.');
     assertEditRevision(snapshot.revision, p.expected_revision);
-    applyPageEdits(snapshot.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
+    applyPageEdits((await materializedSnapshot(ctx.engine, snapshot))!.page, snapshot.tags, ctx.remote !== false, parsePageEdits(p.edits));
   }
   let binding = boundAtStart;
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
@@ -359,23 +372,18 @@ export async function preparePageAdmission(ctx: OperationContext,
     if (!matches) throw new OperationError('invalid_params', 'The CLI directory must match the selected source canonical root.',
       'Register the source canonical path, then omit --dir or use that same path.');
   }
-  // A connector source without a canonical owner is database-only by design
-  // (connector_database): a page write never claims it or refuses as unbound.
-  if (writeThrough && root && !binding && isConnectorSourceKind(source.kind)) authority.databaseOnlyReason = 'connector_database';
-  else if (writeThrough && root && !binding) {
-    if (ctx.engine.kind === 'pglite') binding = await claimWorktree(ctx.engine, sourceId, root, undefined, undefined, { automatic: true });
-    else {
-      // #5393: the opt-in covers every page mutation whose target has no
-      // recorded canonical file; a revert is also judged on the version it writes.
-      const fileBacked = Boolean(snapshot?.page.source_path) || (input.operation === 'revert_version' && snapshot
-        && (await ctx.engine.executeRaw<{ source_path: string | null }>('SELECT source_path FROM page_versions WHERE id=$1 AND page_id=$2',
-          [p.version_id, snapshot.page.id]))[0]?.source_path);
-      if (fileBacked || await readUnboundWritePolicy(ctx.engine) !== 'database_only') {
-        throw unboundSourceError(sourceId, ctx.remote === false ? root : null, fileBacked ? 'file_backed' : 'database_only_eligible', !await managedPersistenceEnabled(ctx.engine));
-      }
-      authority.databaseOnlyReason = 'unbound_source';
-    }
+  if (writeThrough && root && !binding) {
+    // #5393: a revert is also judged on the version it writes.
+    const fileBacked = Boolean(snapshot?.page.source_path) || Boolean(input.operation === 'revert_version' && snapshot
+      && (await ctx.engine.executeRaw<{ source_path: string | null }>('SELECT source_path FROM page_versions WHERE id=$1 AND page_id=$2',
+        [p.version_id, snapshot.page.id]))[0]?.source_path);
+    const decision = await decideUnboundWrite(ctx.engine, { sourceId, sourceKind: source.kind, fileBacked, path: ctx.remote === false ? root : null });
+    if (decision.kind === 'claim') binding = await claimWorktree(ctx.engine, sourceId, root, undefined, undefined, { automatic: true });
+    else authority.databaseOnlyReason = decision.reason;
   }
+  // #6609 (D5): a restore that writes no file refuses a page whose recorded file is gone, unless detach.
+  if (input.operation === 'restore_page') await assertRestoreOrigin(ctx.engine, { sourceId, slug, snapshot,
+    publishesFile: writeThrough && binding !== null, detach: p.detach === true, remote: ctx.remote !== false });
   // #5032: this host publishes the canonical file, and on Windows a ':' in its
   // name cannot be stored; refuse before admission. Database-only writes pass,
   // including read-only mirror sources and pages created while one (#5409).
@@ -386,9 +394,8 @@ export async function preparePageAdmission(ctx: OperationContext,
     && !publishesDatabaseOnly(join(binding.local_path, binding.relative_path), slug, snapshot)) {
     throw colonSlugWindowsRefusal(slug, sourceId);
   }
-  return { typeWarning, slugAdvisory, admission: { principal, operation: input.operation, sourceId, sourceIncarnation: source.incarnation,
-    slug, pageId: snapshot?.page.id ?? null, requestId, callerIntent, intent, authority,
-    ...(input.operation === 'edit_page' ? { terminalReservation: Math.max(16_384, Buffer.byteLength(JSON.stringify(authority)) + 8192)
-      + (await import('./page-edit.ts')).EDIT_PAGE_RECEIPT_RESERVE } : {}),
+  return { typeWarning, slugAdvisory, admission: { origin: ctx.admissionOrigin, principal, operation: input.operation, sourceId, sourceIncarnation: source.incarnation,
+    slug, pageId: snapshot?.page.id ?? null, requestId, clientRequestId: input.batch ? undefined : clientRequestIdOf(params.request_id), callerIntent, intent, authority,
+    ...(input.operation === 'edit_page' ? { terminalReservation: receiptReservation({ intent, authority }, (await import('./page-edit.ts')).EDIT_PAGE_RECEIPT_RESERVE) } : {}),
     worktreeId: writeThrough ? binding?.worktree_id : null, topologyGeneration: writeThrough ? binding?.topology_generation : null } };
 }

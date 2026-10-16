@@ -1,15 +1,25 @@
 import type { BrainEngine } from '../engine.ts';
 import { renderFactsTable, type ParsedFact } from '../facts-fence.ts';
-import { OperationError, opError } from '../ops/contract.ts';
+import { OperationError, opError, type WithdrawnDetail } from '../ops/contract.ts';
 import { fenceOperationError } from '../fence-repair/refusal.ts';
 import { withdrawnFact, withdrawalFenceBlocks } from './withdrawal-overlay.ts';
 import { ambiguousFenceClaims, discoverWithdrawalTargets, withdrawalDiscoveryFailure } from './withdrawal-discovery.ts';
 import { dropPurgedFenceRows } from './purge-overlay.ts';
+import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
 
 export interface WithdrawalCommit {
   withdrawn: boolean;
   pages: Array<{ sourceId: string; slug: string; revision: string }>;
 }
+
+export const FACT_WITHDRAWN_MESSAGE = 'fact_withdrawn: this exact claim was explicitly forgotten in this source and visibility.';
+/**
+ * R1: the refusal names why repeating the claim fails and the write that works. A claim forgotten
+ * without an entity is withdrawn for every entity, so "forget, then remember it with an entity" is refused.
+ */
+export const FACT_WITHDRAWN_SUGGESTION = 'A forgotten claim stays withdrawn, and remembering the same text again is refused; '
+  + 'a claim forgotten without an entity is withdrawn for every entity. If it is still true, remember it in new words. '
+  + 'To link a fact saved without an entity, do not forget it: remember it with entity and replaces set to its fact id.';
 
 /** DB-first: no filesystem ownership, provider work or root lock is required. */
 /**
@@ -38,7 +48,7 @@ export function reviewWithdrawOn(raw: string | null | undefined): boolean {
 
 export async function recordFactWithdrawal(
   engine: BrainEngine, id: number, sourceId: string, worldOnly = false,
-  opts: { requestId?: string; semanticReview?: boolean } = {},
+  opts: { requestId?: string; semanticReview?: boolean; excludePrivate?: boolean } = {},
 ): Promise<WithdrawalCommit> {
   return engine.transaction(async tx => {
     // A managed caller takes this EXCLUSIVE source lock before authority,
@@ -46,7 +56,7 @@ export async function recordFactWithdrawal(
     await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [sourceId]);
     const visible = await tx.executeRaw<{ visibility: 'private' | 'world'; fact: string; fact_hash: string; subject: string }>(
       `SELECT visibility,fact,gbrain_fact_fingerprint(fact) AS fact_hash,COALESCE(entity_slug,'*') AS subject FROM facts WHERE id=$1 AND source_id=$2
-        AND ($3::boolean=false OR visibility='world')`, [id, sourceId, worldOnly]);
+        AND ($3::boolean=false OR visibility='world')${opts.excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''}`, [id, sourceId, worldOnly]);
     if (!visible.length) return { withdrawn: false, pages: [] };
     const { visibility, fact, fact_hash, subject } = visible[0];
     // Discovery is keyed on the claim and its subject: a subject-scoped
@@ -59,7 +69,7 @@ export async function recordFactWithdrawal(
     await tx.lockPageKeys(affected.map(({ slug }) => ({ sourceId, slug })));
     const rows = await tx.executeRaw<{ visibility: string; fact: string; subject: string }>(
       `SELECT visibility,fact,COALESCE(entity_slug,'*') AS subject FROM facts WHERE id=$1 AND source_id=$2
-        AND ($3::boolean=false OR visibility='world') FOR UPDATE`, [id, sourceId, worldOnly]);
+        AND ($3::boolean=false OR visibility='world')${opts.excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''} FOR UPDATE`, [id, sourceId, worldOnly]);
     if (!rows.length) return { withdrawn: false, pages: [] };
     const row = rows[0];
     // Scoped to the forgotten row's entity: the same claim about another
@@ -197,4 +207,21 @@ export async function assertFactNotPurged(engine: BrainEngine, sourceId: string,
   if (!await isFactPurged(engine, sourceId, input.visibility, input.fact, input.entity_slug)) return;
   throw opError('purged_content', 'purged_content: this claim was purged from this source and cannot be saved again.',
     'Purged content stays out of the brain. If it is still true, remember it in new words; only the owner can clear a purge tombstone.');
+}
+
+export const WITHDRAWN_DETAIL_VERSION = 1;
+/** The bounded, versioned `error_detail` a `fact_withdrawn` refusal stores, so a failed receipt keeps its `withdrawn` object. */
+export interface WithdrawalFailureDetail { origin: 'withdrawal'; withdrawn: WithdrawnDetail & { version: typeof WITHDRAWN_DETAIL_VERSION } }
+
+export function withdrawalFailureDetail(error: Pick<OperationError, 'withdrawn'>): WithdrawalFailureDetail | undefined {
+  return error.withdrawn ? { origin: 'withdrawal', withdrawn: { version: WITHDRAWN_DETAIL_VERSION, ...error.withdrawn } } : undefined;
+}
+
+/** The `withdrawn` object a stored `error_detail` carries, validated field by field, or undefined. */
+export function withdrawnFromDetail(detail: unknown): WithdrawnDetail | undefined {
+  if (!detail || typeof detail !== 'object' || (detail as { origin?: unknown }).origin !== 'withdrawal') return undefined;
+  const w = (detail as { withdrawn?: Record<string, unknown> }).withdrawn;
+  if (!w || w.version !== WITHDRAWN_DETAIL_VERSION || typeof w.at !== 'string' || !Number.isFinite(Date.parse(w.at))) return undefined;
+  if (typeof w.subject !== 'string' || !w.subject || w.subject.length > 500 || (w.visibility !== 'world' && w.visibility !== 'private')) return undefined;
+  return { at: w.at, subject: w.subject, visibility: w.visibility };
 }

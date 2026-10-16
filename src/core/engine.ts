@@ -1,7 +1,10 @@
 import type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions } from './page-state/types.ts';
 import type { GetVersionsOpts, PageVersionRows } from './page-state/version-types.ts';
+import type { PageSnapshotBatch } from './page-snapshot-batch.ts';
 import type { LinkReadScope } from './link-validity.ts';
 import type { ChunkWindowRequest, ChunkWindowOpts, ChunkWindowPage } from './search/chunk-windows.ts';
+import type { KeywordPageWindow } from './search/keyword-statement.ts';
+import type { EmbeddingState, EmbeddingStateCounts, EmbeddingStateRow } from './embedding-state.ts';
 import type { DerivedLinkBatchItem, DerivedLinkOrigin, DerivedLinkReplacementOptions } from './derived-links.ts';
 export type { PageKey, PageSnapshot, PageSnapshotOptions, PageWriteOptions, PageMutationPrecondition, PageWithdrawal } from './page-state/types.ts';
 import type {
@@ -129,6 +132,24 @@ export interface BatchOpts {
   signal?: AbortSignal;
 }
 
+/**
+ * Options for `transaction` / `transactionDirect`.
+ *
+ * `signal`: aborting it cancels the transaction. An already-aborted signal
+ * rejects before `BEGIN` is sent. On Postgres an abort while the transaction
+ * runs discards its connection (the socket closes, so the server rolls the
+ * transaction back whether or not a statement is in flight, directly or
+ * through a transaction-mode pooler) and the transaction rejects with an
+ * `AbortError` whose `cause` is the driver's `CONNECTION_CLOSED` error; the
+ * pool reconnects on its next checkout. Every `finally` on the way out runs.
+ * A nested transaction (savepoint) shares its parent's connection, so
+ * aborting it aborts the parent too. PGLite's single in-process connection
+ * cannot interrupt a statement: only the pre-`BEGIN` check applies there.
+ */
+export interface TransactionOptions {
+  signal?: AbortSignal;
+}
+
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
 export interface LinkBatchInput {
   from_slug: string;
@@ -176,6 +197,8 @@ export interface LinkBatchInput {
    * legacy / unknown / pre-v98 semantics.
    */
   link_kind?: string;
+  /** #4381: how the authored reference named its target: `qualified` (`[[source:slug]]`) or `unqualified`. NULL for edges no reference derived. */
+  resolution_type?: 'qualified' | 'unqualified';
 }
 
 /** Input row for addTimelineEntriesBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -226,7 +249,7 @@ export interface ReservedConnection {
   executeRaw<T = Record<string, unknown>>(
     sql: string,
     params?: unknown[],
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; prepare?: boolean },
   ): Promise<T[]>;
 }
 
@@ -335,6 +358,8 @@ export interface TakeHit {
 }
 
 import type { StaleTakeOpts, StaleTakeRow, TakeEmbeddingInput } from './takes-row-types.ts';
+import type { BodyFlipInput, BodyFlipResult, BodyRegion, BodyStagingInput, BodyStagingState, ManifestRow, ManifestRowInput, SegmentChunkInput,
+  SegmentedPageMeta, SegmentSweepOptions, SegmentSweepResult, SegmentTextInput } from './page-body/types.ts';
 export type { StaleTakeOpts, StaleTakeRow, TakeEmbeddingInput } from './takes-row-types.ts';
 
 /** Resolution metadata for resolveTake. */
@@ -659,6 +684,8 @@ export interface FactListOpts {
   fingerprint?: boolean;
   /** #5575 read eligibility (eligibility/sql.ts): read floor, quarantined-page and needs_rederive hiding, proactive suppression. Unset for internal writers. */
   eligibility?: import('./eligibility/policy.ts').ReadEligibility;
+  /** Hide facts whose provenance page (`source_markdown_slug`) is private. Resolved by the trusted operation layer (resolveExcludePrivatePages), never from MCP parameters. */
+  excludePrivate?: boolean;
 }
 
 /** Per-source operational health snapshot consumed by `gbrain doctor`. */
@@ -702,6 +729,8 @@ export interface TrajectoryOpts {
    * `remote: false` explicitly.
    */
   remote?: boolean;
+  /** Same as FactListOpts.excludePrivate: hide points whose provenance page is private. */
+  excludePrivate?: boolean;
   /** Metric filter. When set, only facts with this canonical metric label participate. */
   metric?: string;
   /**
@@ -784,9 +813,9 @@ export interface BrainEngine {
    */
   reconnect(ctx?: { error?: unknown }): Promise<void>;
   initSchema(): Promise<void>;
-  transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
+  transaction<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions): Promise<T>;
   /** Short control transaction on the existing direct route; honors nested transaction scope. */
-  transactionDirect<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
+  transactionDirect<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOptions): Promise<T>;
   /** Mandatory resident-consumer stop barrier before datastore/pool shutdown. */
   registerBeforeDisconnect(stop: () => Promise<void>): () => void;
   /**
@@ -806,6 +835,11 @@ export interface BrainEngine {
    */
   getPage(slug: string, opts?: GetPageOpts): Promise<Page | null>;
   readPageSnapshot(slug: string, opts?: PageSnapshotOptions): Promise<PageSnapshot | null>;
+  /**
+   * `readPageSnapshot(slug, { sourceId })` for a run of exact refs in one statement (page-snapshot-batch.ts):
+   * the longest prefix whose bodies fit `maxBytes`. Postgres binds the refs' sources for RLS.
+   */
+  readPageSnapshotsBatch(refs: ReadonlyArray<{ slug: string; sourceId: string }>, opts?: { maxBytes?: number; includeDeleted?: boolean; absentIsNull?: boolean }): Promise<PageSnapshotBatch>;
   /** Hold exact page identities through commit, including absent rows. Requires a transaction. */
   lockPageKeys(keys: readonly PageKey[]): Promise<void>;
   /**
@@ -856,6 +890,7 @@ export interface BrainEngine {
     sourceId: string,
     opts: { hash: string; frontmatterId?: string | null; excludeSlug?: string },
   ): Promise<{ slug: string; id: number } | null>;
+  findDuplicatePages?(sourceId: string, inputs: ReadonlyArray<{ hash: string; frontmatterId?: string | null; excludeSlug?: string }>): Promise<Array<{ slug: string; id: number } | null>>;
   /**
    * Hard-delete a page row. Cascades to content_chunks, page_links,
    * chunk_relations via existing FK ON DELETE CASCADE.
@@ -1113,6 +1148,10 @@ export interface BrainEngine {
 
   // Search
   searchKeyword(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
+  /** Cat 40 Hard F2: pages matching searchKeyword's strict query (never the OR retry), capped at KEYWORD_COUNT_CAP + 1; `timeoutMs` bounds the Postgres statement. */
+  countKeywordPages(query: string, opts?: SearchOpts & { timeoutMs?: number }): Promise<number>;
+  /** Cat 40 Hard F2: `match: "keyword"` pages, best chunk each, ordered (score DESC, page_id ASC) with no global chunk cap. */
+  searchKeywordPages(query: string, opts: SearchOpts | undefined, page: KeywordPageWindow): Promise<SearchResult[]>;
   /**
    * fix/title-retrieval-arm (D1): page-grain title candidate arm.
    *
@@ -1120,10 +1159,10 @@ export interface BrainEngine {
    * doc_comment + symbol_name_qualified + chunk_text), so a page whose
    * title tokens are absent from its body is unreachable by searchKeyword.
    * This arm queries the PAGE-GRAIN DOCUMENT vector pages.search_vector —
-   * NOT titles alone: per trg_pages_search_vector it is title (weight 'A')
-   * + compiled_truth ('B') + timeline text ('C'). Ranked by ts_rank_cd,
-   * the 'A'-weighted title dominates, but body/timeline matches also
-   * produce (lower-ranked) candidates. Returns page-grain hits joined to
+   * NOT titles alone: per pageSearchVectorSql it is title ('A') + the
+   * first 65,536 chars of the sanitized timeline ('C'); no compiled_truth
+   * since v124. Ranked by ts_rank_cd, the 'A' title dominates, but
+   * timeline matches also produce (lower-ranked) candidates. Returns page-grain hits joined to
    * ONE representative chunk per page (compiled_truth preferred, else
    * lowest chunk_index) so rows are shaped like searchKeyword's output and
    * can enter RRF fusion in hybridSearch.
@@ -1177,9 +1216,9 @@ export interface BrainEngine {
    * earlier in this transaction; the stale-row work is skipped and the page is
    * sealed at that chunker version after the insert. With `pageId` (the
    * caller's own write of that page in this transaction) the seal and the
-   * insert are sent together and the seal's page is checked against it.
+   * insert are sent together and the seal's page is checked against it (`deferSeal`: by the caller, sealImportedPage).
    */
-  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number } & BatchOpts): Promise<void>;
+  upsertChunks(slug: string, chunks: ChunkInput[], opts?: { sourceId?: string; embeddingColumn?: ResolvedColumn; expectedRevision?: string; sealChunkerVersion?: number; pageId?: number; deferSeal?: true } & BatchOpts): Promise<void>;
   /**
    * Read every chunk for a page. Scope precedence mirrors getPage (#2555):
    * a federated grant (`sourceIds[]`) wins over scalar `sourceId`; with
@@ -1190,6 +1229,8 @@ export interface BrainEngine {
    * `getChunksWithEmbeddings`, which honors neither scope precedence nor RLS.
    */
   getChunks(slug: string, opts?: PageReadScope & { includeEmbedding?: boolean; includeUnsealed?: boolean }): Promise<Chunk[]>;
+  /** get_chunks paging: the chunks with chunk_index in [fromIndex, fromIndex + limit) under getChunks' predicate, the count it admits and the highest chunk_index (engine-sql/chunks.ts). */
+  getChunkPage(slug: string, opts: PageReadScope & { fromIndex: number; limit: number }): Promise<{ chunks: Chunk[]; total_chunks: number; max_chunk_index: number | null }>;
   /** Evidence delivery: one batched, re-authorized chunk-window read keyed by page_id (engine-sql/chunks.ts). */
   getChunkWindows(requests: ChunkWindowRequest[], opts: ChunkWindowOpts): Promise<ChunkWindowPage[]>;
   /**
@@ -1322,6 +1363,10 @@ export interface BrainEngine {
     afterPageId?: number;
     sourceId?: string;
   }): Promise<ChunklessPageRow[]>;
+  /** #6696 B3: counts per embedding state over the ACTIVE column (contract and ops/full semantics: src/core/embedding-state.ts). */
+  readEmbeddingStateCounts(opts: { mode: 'ops' | 'full'; sourceIds?: string[]; purgeWindowHours: number }): Promise<EmbeddingStateCounts>;
+  /** #6696 B3: one row per (page, state) in `states`, ordered (state, source_id, slug), at most `limit` rows. */
+  listEmbeddingStateRows(opts: { sourceIds?: string[]; states: readonly EmbeddingState[]; limit: number; purgeWindowHours: number }): Promise<EmbeddingStateRow[]>;
   /**
    * Delete every chunk for a page. Internal page-id lookup is sourceId-scoped
    * when `opts.sourceId` is given; otherwise the bare-slug subquery returns
@@ -1380,6 +1425,12 @@ export interface BrainEngine {
   markPagesExtractedBatch(refs: Array<{ slug: string; source_id: string; extractedAt?: string }>, defaultExtractedAt: string): Promise<number>;
   /** #5761: mark pages attendance-blocked at `revision`; skips refs whose page moved past it. Returns rows marked. */
   markPagesAttendanceBlocked(refs: Array<{ slug: string; source_id: string; revision: string }>): Promise<number>;
+  /** #6454: live pages per source whose stored frontmatter still carries a parser-reserved key (type/title/tags/slug). */
+  countStaleFrontmatterKeyPages(opts: { sourceIds: string[] }): Promise<Array<{ source_id: string; n: number }>>;
+  /** #6454: those pages of one source in id order after `afterId`, with the stale keys each carries. */
+  listStaleFrontmatterKeyPages(opts: { sourceId: string; afterId: number; limit: number }): Promise<Array<{ id: number; slug: string; keys: string[] }>>;
+  /** #6454: strips the reserved keys from the named live pages of one source (coordinated maintenance write); rows changed. */
+  stripStaleFrontmatterKeys(opts: { sourceId: string; ids: number[] }): Promise<number>;
 
   // Links
   /**
@@ -1587,6 +1638,7 @@ export interface BrainEngine {
    *   feature.
    * - `link_source='mentions'` edges are EXCLUDED by default (noisy + the
    *   densest fan-out source); opt in via `includeMentions`.
+   * - Non-ranking link types (src/core/link-ranking-policy.ts) are never walked.
    * - `deleted_at IS NULL` at seed, every neighbor, and every returned node.
    * - Deterministic ordering: hop ASC, edge_count DESC, source_id, slug.
    * Must move in lockstep with the PGLite implementation
@@ -1602,13 +1654,13 @@ export interface BrainEngine {
    * the relation's subject (`toward: 'object'`) or object (`toward:
    * 'subject'`), with every endpoint and origin authorized by the read policy
    * BEFORE the caller scores anything, at most `neighborCap` edges per frontier
-   * node, same-source edges only, mentions excluded. Deterministic order:
-   * frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
+   * node, same-source edges only, mentions and non-ranking link types
+   * excluded (hops and degree). Deterministic order: frontier id, lowest link id. Pinned by test/e2e/engine-parity.test.ts.
    */
   relationalChainHop(frontierPageIds: number[], opts: ChainHopOpts): Promise<ChainHopEdge[]>;
   /**
-   * For a list of page ids, return how many inbound links each has.
-   * Used by hybrid search backlink boost. Single SQL query, not N+1.
+   * For a list of page ids, return how many pages link to each (mentions
+   * and non-ranking link types excluded). Used by hybrid search backlink boost. Single SQL query, not N+1.
    * Keyed by page id — NOT slug — so namesake slugs across sources never
    * share or sum counts (#4380). Ids with zero links map to 0.
    */
@@ -1620,7 +1672,8 @@ export interface BrainEngine {
    * Map, no SQL.
    *
    * Returned shape per page (AdjacencyRow):
-   *   - `hits`: distinct from_page_id count, in-set
+   *   - `hits`: distinct from_page_id count, in-set (non-ranking link
+   *     types excluded, src/core/link-ranking-policy.ts)
    *   - `cross_source_hits`: distinct OTHER source_ids count (excluding
    *     target's own source), in-set
    *
@@ -2265,7 +2318,7 @@ export interface BrainEngine {
    */
   listSupersessions(
     source_id: string,
-    opts?: { since?: Date; limit?: number; visibility?: FactVisibility[]; eligibility?: FactListOpts['eligibility'] },
+    opts?: { since?: Date; limit?: number; visibility?: FactVisibility[]; eligibility?: FactListOpts['eligibility']; excludePrivate?: boolean },
   ): Promise<FactRow[]>;
 
   /**
@@ -2281,15 +2334,16 @@ export interface BrainEngine {
    * Find candidate duplicates for a new fact within a source+entity bucket.
    * Entity-prefilter is mandatory (bounds the contradiction-classifier blast
    * radius). Hard cap k=5 by default. Embedding-cosine when both sides have
-   * embeddings; recency fallback otherwise. `attributedTo` (the new fact's
-   * speaker) drops rows a different known speaker asserted before the k cap;
-   * NULL rows stay candidates.
+   * embeddings; recency fallback otherwise. `arm: 'keyword'` ranks the same
+   * bucket by full-text rank instead (C2 `facts.candidate_fusion`).
+   * `attributedTo` (the new fact's speaker) drops rows a different known
+   * speaker asserted before the k cap, in every arm; NULL rows stay candidates.
    */
   findCandidateDuplicates(
     source_id: string,
     entitySlug: string,
     factText: string,
-    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; attributedTo?: FactAttribution | null },
+    opts?: { k?: number; embedding?: Float32Array; embeddingModel?: string | null; arm?: 'keyword'; attributedTo?: FactAttribution | null },
   ): Promise<FactRow[]>;
 
   /**
@@ -2318,6 +2372,30 @@ export interface BrainEngine {
 
   /** Per-source operational metrics for `gbrain doctor` facts_health check. */
   getFactsHealth(source_id: string): Promise<FactsHealth>;
+
+  // Segmented page storage (Wave B; SQL in engine-sql/page-body.ts). Called only when pages.segmented_storage is on.
+  /** `count` fresh manifest occurrence ids from one sequence; never reused. */
+  allocateBodyOccurrenceIds(count: number): Promise<number[]>;
+  /** Insert segment texts for one source, `ON CONFLICT DO NOTHING`, in statements bounded by STAGE_BATCH_BYTES. */
+  stageSegmentTexts(sourceId: string, texts: readonly SegmentTextInput[]): Promise<{ inserted: number }>;
+  /** Segment texts by sha256 for one source, keyed by lowercase hex; missing shas are absent. */
+  readSegmentTexts(sourceId: string, sha256s: readonly Uint8Array[]): Promise<Map<string, Uint8Array>>;
+  /** Insert manifest rows (staged rows carry `stagingId`), in bounded statements. */
+  stageManifestRows(rows: readonly ManifestRowInput[]): Promise<void>;
+  /** Manifest metadata (never text) of generation `generation` (default: the page's live body_generation), or of a staging, in seq order; `lastN` returns the tail rows of `region` (or the page). */
+  readManifest(pageId: number, opts?: { generation?: number; stagingId?: string; region?: BodyRegion; lastN?: number }): Promise<ManifestRow[]>;
+  /** Insert chunk rows of new occurrences under `generation` (invisible until the flip); chunk_index continues past the page's maximum under a per-page transaction advisory lock. Returns the assigned chunk indexes in input order. */
+  stageSegmentChunks(pageId: number, generation: number, chunks: readonly SegmentChunkInput[], opts?: { embeddingColumn?: ResolvedColumn }): Promise<number[]>;
+  /** Insert the row of a new segmented page at body_generation 0 (never visible outside the transaction that flips it to 1). */
+  createSegmentedPageShell(slug: string, meta: SegmentedPageMeta, opts: { sourceId: string }): Promise<{ id: number }>;
+  /** The generation flip, inside the publication transaction: closes and publishes manifest rows, retires chunk rows (bounded), updates the page row. Refuses `revision_changed` when the page's body_generation is not `expectedGeneration`. */
+  flipBodyGeneration(input: BodyFlipInput): Promise<BodyFlipResult>;
+  /** Record a body staging (GC root while open/sealed/prepared). */
+  openBodyStaging(input: BodyStagingInput): Promise<void>;
+  /** Move a staging to a new state; `commitRequestId` with `committed`. */
+  setBodyStagingState(id: string, state: BodyStagingState, opts?: { commitRequestId?: string | null }): Promise<void>;
+  /** Garbage collection: retired chunks and dead manifest rows (versions are roots), unreferenced texts past the grace window, expired stagings. */
+  sweepSegments(opts?: SegmentSweepOptions): Promise<SegmentSweepResult>;
 
   // Versions
   /**
@@ -2572,12 +2650,12 @@ export interface BrainEngine {
    * parameters; a statement past it fails with SQLSTATE 57014). Inside a
    * transaction the option is ignored (a `SET LOCAL` there would change the
    * enclosing transaction). PGLite ignores it: one in-process connection has
-   * no other session to wait on.
+   * no other session to wait on. `deadlineAt` (#6696, epoch ms) recomputes the bound after the pool wait.
    */
   executeRaw<T = Record<string, unknown>>(
     sql: string,
     params?: unknown[],
-    opts?: { signal?: AbortSignal; timeoutMs?: number },
+    opts?: { signal?: AbortSignal; timeoutMs?: number; deadlineAt?: number },
   ): Promise<T[]>;
 
   /**
@@ -2626,7 +2704,7 @@ export interface BrainEngine {
    */
   getCallersOf(
     qualifiedName: string,
-    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number; chunkId?: number },
   ): Promise<CodeEdgeResult[]>;
 
   /**
@@ -2636,7 +2714,7 @@ export interface BrainEngine {
    */
   getCalleesOf(
     qualifiedName: string,
-    opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean },
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number; bareFallback?: boolean; chunkId?: number },
   ): Promise<CodeEdgeResult[]>;
 
   /**

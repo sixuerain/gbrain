@@ -86,18 +86,28 @@ Options:
                        and screen errors separately (screen_skipped).
   --skip-failed        Legacy sync only: acknowledge previously-recorded
                        sync failures so the bookmark can advance. Held files
-                       never need it; managed sync refuses it.
+                       never need it; a managed source refuses it
+                       (managed_sync_flag_refused), as it does
+                       --include-gitignored.
+  --acknowledge-managed <request_id|path>
+                       Managed sync, owner host only: remove a recorded
+                       failure (for example a --full run's) that the imported
+                       commit already settles; refuses anything still unsynced.
   --retry-failed       Re-attempt previously-failed files; clear on success.
                        Not needed for held files, which re-screen on the next
                        sync when they change (or with 'gbrain sources
-                       retry-held <id>').
+                       retry-held <id>'). On a managed source, failures held
+                       under another run's options are listed with the action
+                       that settles each: a replay or fresh discovery under
+                       their options, the orphan repair, or what is unresolved.
   --reset-checkpoint   Connector source only: re-walk its window once from an empty
                        checkpoint; unchanged pages are not admitted again.
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
-  --no-pull            Skip 'git pull' before the sync. Required on managed
-                       brains: 'gbrain sources refresh <id>' moves the
-                       checkout, and sync catches the index up to it.
+  --no-pull            Skip 'git pull' before the sync. Implied on managed
+                       brains, which never pull during sync: 'gbrain sources
+                       refresh <id>' moves the checkout, and sync catches the
+                       index up to it.
   --no-bulk            Managed Postgres sync: publish one page per transaction
                        instead of bulk groups (each page keeps its own write
                        request either way). Persist with
@@ -118,7 +128,14 @@ Options:
                        the host keeps one write consumer. This flag (or
                        GBRAIN_SYNC_NO_DELEGATE=1) opts out: on Postgres the
                        sync runs here beside the serve; on PGLite it fails
-                       fast if a live serve holds the brain.
+                       fast if a live serve holds the brain. It never skips
+                       the drain lease: one drainer per managed source.
+  --break-lock         Release the source's sync lock (the managed drain
+                       lease) left by a holder that is gone: a dead pid on
+                       this host, or a heartbeat past its TTL. A live holder
+                       is never broken; --max-age <s> narrows it.
+  --force-break-lock   Release it without the liveness check (destructive:
+                       only when you have stopped the holder yourself).
   --no-schema-pack     Skip loading the active schema pack (no per-file pack
                        regex runs; pages use legacy prefix typing). Escape
                        hatch if a suspect pack regex is wedging sync.
@@ -158,6 +175,15 @@ Options:
                        until it is done, blocked, or this budget ends;
                        progress never extends it. A stopped managed drain
                        is 'resumable' (exit 0): rerun the same command.
+                       When another process is draining the source (a
+                       serve, a sync job, another terminal), the run follows
+                       it within this budget and its own deadline, printing
+                       the holder and the pages it commits; it takes over
+                       when the holder finishes. Out of budget it is
+                       'resumable' with code sync_drain_lease_held; a holder
+                       that commits nothing for 5 minutes stops it blocked
+                       (drain_stalled). Ctrl-C stops following and leaves
+                       the holder alone.
                        See docs/guides/live-sync.md (catching up a large
                        backlog on managed Postgres).
   --yes                Accept any interactive prompts (CI / non-TTY).
@@ -228,8 +254,6 @@ export function parseSyncFlags(args: string[]) {
   const skipFailed = args.includes('--skip-failed');
   const retryFailed = args.includes('--retry-failed'), resetCheckpoint = args.includes('--reset-checkpoint');
   const noSchemaPack = args.includes('--no-schema-pack'); // v0.41.37.0 #1569
-  const explicitProcessing = ([['--no-embed', 'noEmbed'], ['--no-extract', 'noExtract'], ['--no-schema-pack', 'noSchemaPack']] as const)
-    .filter(([flag]) => args.includes(flag)).map(([, key]) => key);
   const includeGitignored = args.includes('--include-gitignored');
   // Untracked-gap fix: --working-tree imports uncommitted working-tree state.
   // The config fallback (sync.include_working_tree) resolves inside
@@ -281,7 +305,7 @@ export function parseSyncFlags(args: string[]) {
     console.error(`--max-age cannot be combined with --force-break-lock (force skips all guards).`);
     process.exit(1);
   }
-  return { repoPath, watch, interval, dryRun, full, noPull, noBulk, lanes, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, explicitProcessing, includeGitignored, workingTree, syncAll, missingPathMode, jsonOut, yesFlag, breakLock, forceBreakLock, maxAgeSeconds };
+  return { repoPath, watch, interval, dryRun, full, noPull, noBulk, lanes, noEmbed, noExtract, skipFailed, retryFailed, resetCheckpoint, noSchemaPack, includeGitignored, workingTree, syncAll, missingPathMode, jsonOut, yesFlag, breakLock, forceBreakLock, maxAgeSeconds };
 }
 
 export type SyncFlags = ReturnType<typeof parseSyncFlags>;

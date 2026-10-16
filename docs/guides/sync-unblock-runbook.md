@@ -14,6 +14,7 @@ a page needs my decision."*
 ## The loop
 
 ```bash
+gbrain doctor --only serve_build_drift --json    # first: on a warning, restart serve and workers and stop here
 gbrain sync status --source <id> --json          # every N minutes (read-only)
 gbrain sync unblock --source <id> --apply --json # when committed_last_10m is 0 and needs_human is false
 gbrain sync <next.argv...>                       # the sync unblock (or status) names: the cursor's own options
@@ -22,6 +23,10 @@ gbrain sync <next.argv...>                       # the sync unblock (or status) 
 **Say to your agent:** *"Repair the files sync held and get the catch-up
 moving again; ask me only about the ones gbrain will not decide by itself."*
 
+0. Check the build. `serve_build_drift` warns when serve or a worker on this
+   host runs an older gbrain build than this checkout; restart them with the
+   command it prints before anything else, and stop until it reads ok
+   ([serve build drift](troubleshooting.md#serve-build-drift)).
 1. Read `status`. `cursor` is where the run stands (`index/total`, the
    `pinned_target` commit, `last_advance_at`); `committed_last_10m` is the
    signal that data is moving (a live process with a flat cursor is not
@@ -84,6 +89,7 @@ Every hold and error has three fields, from one table
 |---|---|---|---|---|
 | `worktree_dirty` | page | retry_when_clean | no | held 3 times: the file keeps changing without being committed |
 | `concurrent_write` | page | reconcile | yes | always: the file and the database page diverge |
+| `file_drift` | page | reconcile | yes | always: the page changed in the database since its file was last imported |
 | `preparation_stalled` | page | retry, upgrade | no | held 3 times, or writer status names a step that never finishes |
 | `invalid_fence` | page | repair | no | the fence repair preview offers no plan (a manual reason) |
 | `invalid_frontmatter` | page | repair | no | the repair preview needs an interpretation (--include-ambiguous) |
@@ -92,25 +98,70 @@ Every hold and error has three fields, from one table
 | `file_too_large` | page | none | yes | always |
 | `content_rejected` | page | none | yes | always |
 | `parser_regression` | page | upgrade | yes | always: a gbrain bug |
-| `managed_image_sync_unsupported` | page | none | no | never: images stay held by design |
+| `managed_image_sync_unsupported` | page | none | no | never: images stay held while multimodal embedding is off |
 | `revision_conflict` | page | retry | no | the same path fails again after a rerun |
 | `page_identity_changed` | page | retry | no | the same path fails again after a rerun |
 | `pinned_git_worktree_conflict` | page | retry | no | the same path fails again after a rerun |
 | `source_changed` | page | retry | no | the same path fails again after a rerun |
+| `cancelled` | page | retry | no | the same group is cancelled again after a rerun |
+| `knock_on` | page | retry | no | never: superseded; an older gbrain cancelled this page for another page's failure and a plain sync re-freezes it |
+| `run_replaced` | page | retry | no | never: another run of the source superseded this one and covers its pages |
+| `outside_fence` | systemic | none | yes | always: a request published outside the cursor that admitted it |
+| `knock_on_exhausted` | page | retry | no | never: superseded; a plain sync resumes the entry an older gbrain stopped on |
 | `sync_incomplete` | page | retry | no | never: an unfinished cursor resumes with the same command |
 | `connection_lost` | connection | retry | no | three reruns in a row end connection_lost (the database is unreachable from this host) |
 | `database_contention` | connection | retry | no | three reruns in a row stop on it |
 | `write_capacity` | connection | retry | no | writer status shows the cap held by requests that never settle |
+| `write_capacity_backpressure` | connection | retry | no | reason lifetime_ids (request ids never free, so only the host raise lifts it), or the pause outlasts a day |
+| `capacity_paused` | connection | retry | no | reason lifetime_ids (only the host raise resumes it), or the same pause after the raise |
+| `sync_drain_lease_held` | connection | retry | no | never: a holder that stops committing ends the run drain_stalled instead |
 | `storage_error` | connection | retry | no | the same error after a rerun (then it is not a dropped connection) |
+| `graduation_in_progress` | connection | retry | no | gbrain migrate --status --json reports no running move and the fence still refuses |
 | `preparation_systemic` | systemic | upgrade, retry | yes | always |
 | `drain_stalled` | systemic | none | yes | always |
 | `recovery_required` | systemic | none | yes | always |
 | `owner_unavailable` | systemic | none | yes | always |
 | `writer_coordinator_required` | systemic | none | yes | always |
 | `permission_denied` | systemic | none | yes | always |
+| `write_quota_exhausted` | systemic | none | yes | always |
+| `write_quota_insufficient` | systemic | none | yes | always |
 | `plan_stale` | systemic | none | yes | always |
+| `slug_root_mode_mismatch` | systemic | none | yes | always: the two modes give different slugs |
 | `invalid_params` | systemic | none | yes | always |
+| `cursor_incarnation_retired` | systemic | repair | no | the repair preview lists nothing to retire, or the same code returns after the apply |
 <!-- sync-fault-table:end -->
+
+A `cancelled` error whose group was released by a lane fault (`lock_timeout`
+or `statement_timeout` on a parallel publish lane) also carries that fault as
+`last_error.detail`, and the cancelled rows keep it as their `blocked_reason`
+(`lane_lock_timeout`, `lane_statement_timeout`) and in the cancel message.
+The verdict is the same retry; the detail says the database, not the page,
+ended the group.
+
+Each page of a sync has its own fate (#6712): a page that does not commit is
+held, retried or stops the run on its own, and the pages admitted after it
+still publish and are counted from their own receipts. No page is cancelled
+for another page's failure, and two changes of one page (a delete and an
+import of one slug, say) are never published in the same group: the later
+one waits for the earlier one, and is held behind it (`blocked_on`) when the
+earlier one is held. A file that changed after its request was admitted
+(`source_changed`) is retried after the manifest's last entry, at most three
+times, then held `worktree_dirty`. A transport fault re-freezes the entry in
+place; a systemic stop is re-frozen in place by the next plain sync, at most
+three times in a row before the failure stays recorded for `--retry-failed`.
+
+A `knock_on` or `knock_on_exhausted` error was written by an older gbrain
+(a page cancelled only because another page of its sync did not commit, or
+the stop that bounded re-freezing them). Both are superseded: the next plain
+sync re-freezes the entry under a fresh request; act on `root_cause` if it
+fails again. A cursor refusal is classified by its recorded cause:
+`run_replaced` (another run of the source took over; nothing to do) or
+`outside_fence` (a request was not the entry its cursor held: a person stops
+the extra drain and reports it); an older build's `window_dropped` reads as
+a knock-on. A checkpoint refused by a receipt at an index the cursor passed
+without a commit is re-assessed on every resume and commits without
+rediscovering the manifest; one a receipt still blocks is rediscovered by
+`--retry-failed`.
 
 An unknown code is systemic and human: `gbrain errors <code>` explains it
 offline, `gbrain doctor --json` says what the brain thinks.
@@ -147,7 +198,9 @@ it and kept going; the receipt lists the hold (`held`, `held_count`) and
 - `revision_conflict`, `page_identity_changed`, `pinned_git_worktree_conflict`
   as a `last_error` come from a run on an older release; this release holds
   them. Rerun with `--retry-failed`: the stopped entry converts in place, the
-  manifest is not re-frozen.
+  manifest is not re-frozen. A `revision_conflict` or `cancelled` error with
+  `detail: knock_on` needs no flag: the next plain sync re-freezes the entry
+  (act on `root_cause` instead).
 
 ### Connection
 
@@ -165,6 +218,18 @@ A retry alone changes nothing: the write owner is wedged
 company-brain approval drifted (`plan_stale`), or the principal may not sync.
 Page a person with `human_reason`; the fix is on the brain host.
 
+`slug_root_mode_mismatch` is the one systemic code that is a choice, not a
+repair: a source in a subdirectory of its repository pins one
+`slug_root_mode`, the run used the other, and the two give different slugs.
+Ask the user which mode the source keeps. Restoring the pin to the run's mode
+lets the next plain `gbrain sync --no-pull --source <id>` finish (the refused
+checkpoint is retried by itself); keeping the new pin takes
+`gbrain sync --no-pull --source <id> --retry-failed`, and the pages the refused
+run wrote keep their old slugs beside the new ones. A source rooted at its
+repository root never gets this code: both modes give it the same slugs, and
+a checkpoint an older release refused there as `revision_conflict` finishes on
+the next plain sync.
+
 ## Why the manifest is not re-frozen any more
 
 The frozen manifest always lived in the cursor (`op_checkpoints`, op
@@ -178,6 +243,20 @@ failure still writes a ledger row.
 When HEAD moved past the pinned target while the run drained, the drain takes
 exactly one more pass (an incremental pin..HEAD discovery) so the invocation
 ends at HEAD; never a second one, so a live checkout cannot loop.
+
+## A cursor doctor reports that no sync can reach
+
+`sync_incomplete` in the table above resumes with the same command because the
+live writer reads its own cursor key. A cursor written under a key nothing
+current derives (an older writer identity such as a `legacy_token` principal,
+a revoked local writer, a cursor from before sync options were recorded) is
+still read by doctor, so `sync_failures` reports it after every green sync.
+That is not a page fault and no rerun clears it: preview
+`gbrain repair managed-sync-orphans --source <id>`, relay the listed classes
+(`no_cursor`, `principal_unadoptable`, `superseded`) and the kept rows, then
+apply with the printed `--apply --expect <hash>` once the user agrees. A cursor
+with a live pending request is kept; the loop above owns it
+([repair guide](repair.md#managed-sync-orphans)).
 
 ## See also
 

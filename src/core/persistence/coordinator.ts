@@ -17,7 +17,7 @@ import { chargePreparationAttempt, clearResolvedRecovery, completeWrite, getWrit
 import type { WaitingOn } from './claim-phase.ts';
 import { preparationKind } from './preparation-budget.ts';
 import { isTerminal, principalKey, requestPrincipal, recoveryFiles, type FileRecoveryRecord, type RecoveryRecord, type WriteRequest } from './model.ts';
-import type { NativeLockHandle } from './native-lock.ts';
+import { isLockOpenFailure, noteLockOpenFailure, type NativeLockHandle } from './native-lock.ts';
 import { withCoordinatedWrite } from './context.ts';
 import { lockCoreSources } from './core-guard.ts';
 import { publicationAttribution } from './attribution.ts';
@@ -31,14 +31,19 @@ import { authorizePageVisibility } from './page-visibility.ts';
 import { withNoRepoWriteThroughWarning } from '../write-through.ts';
 import { assertUnboundPublication, classifyUnboundPage, unboundWriteWarning } from './unbound-source.ts';
 import { assertRecoveryStagingAbsent, cleanupRecoveryStaging, recoveryStagingFile, upgradeRecoveryStaging } from './staging.ts';
+import { bindPublicationTimeouts, publicationTransaction } from './publication-deadline.ts';
 import { assertMutationProtocol, assertSharedSkillPersistence, declareDurablePersistence, PERSISTENCE_PROTOCOL_PREDICATE } from './protocol.ts';
 import { assertBundleRecoveryBinding, bundleFileHash, prepareBundleRecovery, publishStagedBundleFile, stageBundleFile, type MutationFile } from './bundle-files.ts';
 import { assertKnowledgePublicationAllowed } from '../shared-skills/knowledge-guard.ts';
 import { classifyMirrorPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
-import { databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { PENDING_IMPORT, SYNC_HELD } from './pending-import.ts';
+import { CANONICAL_FILE_MISSING, databaseRefusal, ownerExceptionFailure, withAttempt, type PublicationFailure, type PublicationFailureDetail, type PublicationStage } from './publication-failure.ts';
+import { SYNC_CURSOR_REPLACED } from './sync-checkpoint-replaced.ts';
 import { fenceFailureDetail } from '../fence-repair/refusal.ts';
+import { withdrawalFailureDetail } from '../facts/withdrawal.ts';
 import { faultPoint, withFaultPoints } from './fault-points.ts';
 import { recordPublicationFenceTrend } from '../fence-repair/census-store.ts';
+import { segmentWriteScope } from '../page-body/ingest.ts';
 
 interface PreparedMutationBase {
   sourceExclusive?: boolean;
@@ -51,7 +56,9 @@ interface PreparedMutationBase {
   contentUnchanged?: boolean;
   deferEmbedding?: boolean;
   /** Why a page write bound to a worktree publishes no file (receipt `write_through.skipped`). */
-  databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only';
+  databaseOnlyReason?: 'db_only' | 'unbound_source' | 'mirror_read_only' | 'sync_excluded' | 'shared_origin';
+  /** #6517: the receipt's `write_through.warning` for a database-only publication, set by `validate` under the publication guards. */
+  databaseOnlyWarning?: string;
   /**
    * Must perform only transaction-composable database work. `preimage` (#5984)
    * is the publisher's read of the page under its page guard, after the revision
@@ -67,6 +74,11 @@ interface PreparedMutationBase {
   validate?(tx: BrainEngine): Promise<void>;
   /** #5575: the tier and origin of the rows apply writes; absent: the request's channel tier (trust/channel.ts). */
   trust?: WriteTrust;
+  /**
+   * Wave B: runs once the publication committed and its recovery record is cleared (a segmented page's
+   * deferred projection and segment GC). Best effort: the projection queue and GC converge after a failure.
+   */
+  afterCommit?(engine: BrainEngine): Promise<void>;
 }
 /**
  * A page file target; `publishMode` (Google pages) is the exact mode it publishes with, and its created directories get 0700.
@@ -125,20 +137,23 @@ export { fileHash as persistenceFileHash, publishFile as publishPersistenceFile 
 function requestError(error: unknown): PublicationFailure {
   if (error instanceof OperationError) {
     // #6188: a typed fence refusal keeps its location in the bounded detail, which outlives receipt compaction.
-    const fence = fenceFailureDetail(error);
-    return { code: error.code, message: error.message, ...(fence ? { detail: fence } : {}) };
+    const detail = fenceFailureDetail(error) ?? withdrawalFailureDetail(error) ?? (error.syncRefusal as PublicationFailure['detail'] | undefined)
+      ?? (error.detail === CANONICAL_FILE_MISSING ? { origin: CANONICAL_FILE_MISSING } : undefined)
+      // #6693: a refusal on a page whose file awaits import or is held by sync; the replay after import selects on it.
+      ?? (error.code === 'source_changed' && (error.reason === PENDING_IMPORT || error.reason === SYNC_HELD) ? { origin: error.reason } : undefined);
+    return { code: error.code, message: error.message, ...(detail ? { detail } : {}) };
   }
   const refusal = databaseRefusal(error);
   if (refusal) return refusal;
   const code = (error as { code?: string })?.code;
-  if (code === 'revision_conflict') {
+  if (code === 'revision_conflict' || code === 'revision_required') {
     return { code, message: error instanceof Error && error.message ? error.message : 'The page changed after the supplied revision was read.' };
   }
   // #5216: the row still awaits its revision backfill; the error names the resume command.
   if (code === 'revision_backfill_pending' && error instanceof Error) return { code, message: error.message };
   return ownerExceptionFailure(error);
 }
-function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed'].includes(code); }
+function conflictCode(code: string): boolean { return ['revision_required','revision_conflict','revision_backfill_pending','source_changed','page_identity_changed',SYNC_CURSOR_REPLACED].includes(code); }
 export function transientDatabaseFailure(error: unknown): boolean {
   return ['40001','40P01','55P03','57014','53300','57P01','57P02','57P03','08000','08003','08006','08001','08004',
     'ECONNRESET','ECONNREFUSED','ETIMEDOUT','CONNECTION_CLOSED','CONNECTION_ENDED'].includes(String((error as {code?:string})?.code));
@@ -223,6 +238,7 @@ export function decoratePublicationOutcome(row: WriteRequest, prepared: Prepared
   if ((outcome.write_through as { skipped?: string }).skipped === 'unbound_source') {
     outcome.write_through = { ...outcome.write_through as object, warning: unboundWriteWarning(row.operation, row.source_id, row.authority.databaseOnlyReason === 'unbound_source') };
   }
+  if (prepared.databaseOnlyWarning) outcome.write_through = { ...outcome.write_through as object, warning: prepared.databaseOnlyWarning };
 }
 
 /**
@@ -262,6 +278,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
   let recovery: RecoveryRecord | null = null;
   let published = false;
   let transactionBodyCompleted = false;
+  let afterCommitDue = false;
   const skill = prepared.target === 'skill_bundle';
   const files = skill ? prepared.files ?? [] : prepared.file ? [prepared.file] : [];
   try {
@@ -278,7 +295,14 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         await releaseUnpublishedClaim(engine, row, 'owner_unavailable');
         return (await getWriteRequestById(engine, row.id))!;
       }
-      lock = await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true });
+      try { lock = await acquireWorktree(binding, 0, undefined, engine, { yieldLanes: true }); }
+      catch (error) {
+        // #6305: this process cannot open the lock file (sandbox, unwritable lock directory): like a busy lock, publish nothing.
+        if (!isLockOpenFailure(error)) throw error;
+        noteLockOpenFailure(row.worktree_id, error);
+        await releaseUnpublishedClaim(engine, row, 'writer_lock_unavailable');
+        return (await getWriteRequestById(engine, row.id))!;
+      }
       if (!lock) {
         await releaseUnpublishedClaim(engine, row, 'writer_busy');
         return (await getWriteRequestById(engine, row.id))!;
@@ -336,7 +360,8 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       recovery = record;
       await hooks.boundary?.('prepared', row);
     }
-    const done = await engine.transaction(async tx => {
+    const done = await publicationTransaction(engine, async tx => {
+      await bindPublicationTimeouts(tx);
       await declareDurablePersistence(tx);
       const liveBinding = await guardOwnership(tx, row, hostId);
       if (prepared.sourceExclusive && !prepared.exclusiveSources?.length) await tx.executeRaw('SELECT id FROM sources WHERE id=$1 FOR UPDATE', [row.source_id]);
@@ -347,7 +372,11 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       // A page target's visibility is checked below, once its page is locked.
       await authorizeStoredRequest(tx, row, true, { pageVisibility: skill });
       await lockCounters(tx, ['brain', principalKey(requestPrincipal(row)), ...(row.worktree_id ? [`worktree:${row.worktree_id}`] : [])]);
-      const [current] = await tx.executeRaw<WriteRequest>('SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [row.id]);
+      // A file publication stamps `publication_started` on the row lock it takes anyway; the stamp lives and dies
+      // with this transaction either way (control.ts reads a rolled-back stamp as "never started").
+      const [current] = await tx.executeRaw<WriteRequest>(recovery
+        ? 'UPDATE persistence_requests SET publication_started=true WHERE id=$1::uuid RETURNING *'
+        : 'SELECT * FROM persistence_requests WHERE id=$1::uuid FOR UPDATE', [row.id]);
       if (!current || current.execution_token !== row.execution_token || current.state !== 'running') throw opError('write_claim_lost', 'Execution claim changed before publication.',
         `Another worker took over request ${row.request_id} (its execution claim expired or was reassigned) before this attempt published, so this attempt wrote nothing and the current holder decides the outcome. Inspect the request rather than resubmitting it.`,
         { fix: requestFix(row) });
@@ -373,7 +402,6 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
         for (const record of records) if ((skill ? bundleFileHash(record) : fileHash(record.path)) !== record.beforeHash) {
           throw localEditRefusal('The canonical file changed during preparation.', row, skill, 'while the write was being prepared');
         }
-        await tx.executeRaw('UPDATE persistence_requests SET publication_started=true WHERE id=$1::uuid', [row.id]);
         await hooks.boundary?.('before_publication', row);
         // Mark before the call: a rename followed by an fsync error still needs recovery.
         published = true;
@@ -407,6 +435,7 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
     });
     await hooks.boundary?.('after_commit', done);
     if (recovery) await clearResolvedRecovery(engine, row.id, done);
+    afterCommitDue = done.state === 'committed';
     return done;
   } catch (error) {
     if (recovery) {
@@ -429,7 +458,11 @@ export async function publishMutation(engine: BrainEngine, row: WriteRequest, pr
       return (await getWriteRequestById(engine, row.id))!;
     }
     return finishUnpublishedFailure(engine, row, error);
-  } finally { releaseCapacity?.(); await lock?.release(); }
+  } finally {
+    releaseCapacity?.();
+    await lock?.release();
+    if (afterCommitDue) await prepared.afterCommit?.(engine).catch(() => undefined);
+  }
 }
 
 export async function recoverPublication(engine: BrainEngine, id: string, hostId = localHostId(), alreadyLocked = false,
@@ -527,6 +560,8 @@ export async function recoverPublication(engine: BrainEngine, id: string, hostId
       await faultPoint('publication_recovery:before_clear', { requestId: row.request_id, sourceId: row.source_id, operation: row.operation });
       await clearResolvedRecovery(engine, id);
       row = (await getWriteRequestById(engine, id))!;
+      const pageId = row.page_id === null || row.state !== 'committed' ? null : Number(row.page_id);
+      if (pageId !== null) await segmentWriteScope(engine, row.source_id).then(writes => writes(exec => exec.sweepSegments({ pageId }))).catch(() => undefined);
     }
     return row;
   } finally { releaseCapacity?.(); await lock?.release(); }

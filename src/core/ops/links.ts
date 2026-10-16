@@ -1,5 +1,5 @@
 import { coordinatedManualLinkWrite } from '../persistence/manual-links.ts';
-import { filterBacklinkRows, readBacklinkPage, wantsPagedBacklinks } from './backlinks-paged.ts';
+import { filterBacklinkRows, readBacklinkPage, wantsPagedBacklinks, withLinkPageStatus } from './backlinks-paged.ts';
 /**
  * Links + graph operation cluster — pure move from operations.ts (v0.46.x
  * tranche 1). MANAGED_LINK_SOURCES stays exported (test suite + operations.ts
@@ -410,10 +410,10 @@ const get_backlinks: Operation = {
     cursor: { type: 'string', description: 'Paging.' },
   },
   handler: async (ctx, p) => {
-    if (!wantsPagedBacklinks(p)) return readLinkEdges(ctx, p, 'get_backlinks', 'in');
     if (p.group !== undefined) return readBacklinkPage(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy);
     const links = await readLinkEdges(ctx, p, 'get_backlinks', 'in');
-    return filterBacklinkRows(ctx, p, (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy, links);
+    const policy = async () => (await resolveLinkReadScope(ctx, p, 'get_backlinks')).policy;
+    return withLinkPageStatus(ctx, policy, wantsPagedBacklinks(p) ? await filterBacklinkRows(ctx, p, await policy(), links) : links);
   },
   scope: 'read',
   cliHints: { name: 'backlinks', positional: ['slug'] },
@@ -427,7 +427,7 @@ const list_link_sources: Operation = {
   // v114 (#1941): the read-side counterpart to link-add/link-rm. Since
   // link_source is now an open kebab provenance (no allowlist), this is how an
   // agent discovers which provenances a brain actually carries.
-  description: 'Link provenances in the brain (e.g. markdown, manual) with edge counts.',
+  description: 'Link provenances (e.g. markdown, manual) with their edge counts.',
   params: {},
   handler: async (ctx) => {
     // Route through sourceScopeOpts so the read honors both scalar ctx.sourceId
@@ -522,11 +522,11 @@ const traverse_graph: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: 'retrieval',
-  description: `Walk the link graph from a page. Remote callers get bidirectional paths at depth ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH} by default.`,
+  description: `Walk the link graph from a page. Remote default: both directions, depth ${REMOTE_BIDIRECTIONAL_DEFAULT_DEPTH}.`,
   params: {
     slug: { type: 'string', description: 'Start page slug.', required: true },
     depth: { type: 'number', description: `Max depth (cap ${TRAVERSE_DEPTH_CAP}).` },
-    link_type: { type: 'string', description: 'Follow only this link type.' },
+    link_type: { type: 'string', description: 'Only this link type.' },
     direction: { type: 'string', description: 'Remote default both.', enum: ['in', 'out', 'both'] },
     hops: {
       type: 'array',

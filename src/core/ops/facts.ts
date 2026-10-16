@@ -1,8 +1,11 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
+import { recordFunnelEvent, recordRecallOutcome } from '../funnel.ts';
 import { parseRelationalPlan } from '../search/relational-plan.ts';
 import { loadSearchModeConfig, resolveSearchMode } from '../search/mode.ts';
 import { WRITE_REQUEST_PARAM } from '../persistence/params.ts';
-import { deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
+import { parseWriteRequestId } from '../persistence/preconditions.ts';
+import { countEvidenceTokens, deliverEvidence, effectivePlan, resolveEvidencePlan, type DeliveryMeta, type EvidencePlan } from '../search/evidence-delivery.ts';
+import { withFactDateHeaders } from '../search/evidence-date.ts';
 import { randomUUID } from 'node:crypto';
 import { readHolders } from './context.ts';
 /**
@@ -25,7 +28,7 @@ import { OperationError, opError, verbError } from './contract.ts';
 import { invalidParam, paramUse } from './op-fix.ts';
 import { assertExplicitSourceLive, federatedSearchScope, parseSourceIdParam, sourceScopeOpts, stampEvidenceSafe } from './context.ts';
 import { markKeywordHits } from '../search/evidence.ts';
-import { hybridSearchCached, stampContentFlags } from '../search/hybrid.ts';
+import { hybridSearchCached, stampContentFlags, type HybridSearchOpts } from '../search/hybrid.ts';
 import { dedupResults } from '../search/dedup.ts';
 import { bumpLastRetrievedAt } from '../last-retrieved.ts';
 import { packToBudget, estimateTokens, resultTokens } from '../search/token-budget.ts';
@@ -47,6 +50,8 @@ import { activationSuppressionNotice, suppressionSummary } from '../eligibility/
 import { stampPageTrust, stampRowTrust } from '../eligibility/stamp.ts';
 import type { TrustTier } from '../trust/tier.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
+import { parseRelativeSince } from '../facts/since-parse.ts';
+import { parseQuestionParam, questionRecallNotices, rankFactsByQuestion, recallHintNotice, unlinkedNamesakes, type EntityCandidate, type QuestionRecall } from '../facts/question-recall.ts';
 
 // ============================================================
 // v0.31 — Hot memory ops: extract_facts / recall / forget_fact
@@ -128,7 +133,7 @@ const extract_facts: Operation = {
     const r = await runFactsPipeline(p.turn_text as string, {
       engine: ctx.engine,
       operationContext: ctx,
-      requestId: typeof p.request_id === 'string' ? p.request_id : randomUUID(),
+      requestId: parseWriteRequestId(p.request_id) ?? randomUUID(),
       requestIntent: { ...p, request_id: undefined },
       sourceId,
       sessionId: typeof p.session_id === 'string' ? p.session_id : null,
@@ -188,6 +193,8 @@ const extract_facts: Operation = {
       superseded: r.superseded,
       fact_ids: r.fact_ids,
       ...(r.write_requests ? { write_requests: r.write_requests } : {}),
+      ...(r.withdrawn_skipped ? { withdrawn_skipped: r.withdrawn_skipped } : {}),
+      ...(r.would_dedup_same_page ? { would_dedup_same_page: r.would_dedup_same_page } : {}),
       ...hintAccounting,
     };
   },
@@ -196,6 +203,46 @@ const extract_facts: Operation = {
 /** One arm of recall's budget_packing accounting. */
 function packingArm<T>(candidates: T[], kept: T[], cost: (item: T) => number) {
   return { candidates: candidates.length, kept: kept.length, dropped: candidates.length - kept.length, used: kept.reduce((sum, r) => sum + cost(r), 0) };
+}
+
+/**
+ * A result row's cost in recall's packing. A delivered block costs what delivery counted (its text and title in
+ * delivery's tokenizer), so recall never re-cuts a set delivery already fit using a different estimator.
+ */
+function recallResultCost(delivery: DeliveryMeta | undefined): (r: SearchResult) => number {
+  if (!delivery) return resultTokens;
+  return r => r.delivered ? r.delivered.tokens + countEvidenceTokens(r.title ?? '', delivery.tokenizer) : resultTokens(r);
+}
+
+/**
+ * Facts pack first under a budget (every policy but query_first), so delivery gets only what they leave.
+ * Sized to the whole budget, delivery filled it and recall then dropped whole delivered blocks after the facts.
+ * Null when the facts leave nothing: delivery is skipped and the results arm packs empty.
+ */
+function recallDeliveryPlan(plan: EvidencePlan | null, policy: unknown, queryText: string | null, budgetTokens: number | null, rows: Array<{ fact: string }>): EvidencePlan | null {
+  if (!plan || budgetTokens === null || (policy === 'query_first' && queryText !== null)) return plan;
+  const left = Math.min(plan.budgetTokens, budgetTokens - packToBudget(rows, r => estimateTokens(r.fact), budgetTokens).meta.used);
+  return left > 0 ? { ...plan, budgetTokens: left } : null;
+}
+
+/** recall's budget_packing meta: only policy-supplied calls carry it. */
+function recallBudgetPacking<F extends { fact: string }>(policy: unknown, queryText: string | null, budgetTokens: number | null,
+  arms: { rows: F[]; packedFacts: F[]; searchResults: SearchResult[]; packedResults: SearchResult[] }, resultCost: (r: SearchResult) => number) {
+  if (policy !== 'facts_first' && policy !== 'query_first') return undefined;
+  const queryFirst = policy === 'query_first' && queryText !== null && budgetTokens !== null;
+  const { rows, packedFacts, searchResults, packedResults } = arms;
+  return {
+    policy: queryFirst ? 'query_first' : 'facts_first',
+    applied: budgetTokens !== null && (queryFirst || (policy === 'facts_first' && budgetTokens > 0)),
+    reason: policy === 'query_first' && !queryText ? 'no_query'
+      : budgetTokens === null ? 'no_positive_finite_budget'
+        : budgetTokens === 0 ? 'budget_below_one'
+          : rows.length + searchResults.length === 0 ? 'no_candidates'
+            : packedFacts.length + packedResults.length === 0 ? 'first_items_exceed_budget'
+              : 'packed',
+    facts: packingArm(rows, packedFacts, r => estimateTokens(r.fact)),
+    results: packingArm(searchResults, packedResults, resultCost),
+  };
 }
 
 /**
@@ -217,22 +264,23 @@ const recall: Operation = {
   mutating: false,
   idempotent: true,
   outputRedaction: { retrieval: { localVerbatim: ['facts'] } },
-  description: 'MEMORY VERB (v1): read saved facts by entity, since or session_id; `query` also searches pages. Remote callers see world facts only. One card: entity; reasoning: synthesize.',
+  description: 'MEMORY VERB (v1): read facts by entity, since or session_id; `query` also searches pages. Remote callers: world facts only. One card: entity; reasoning: synthesize.',
   params: {
-    entity: { type: 'string', description: 'Entity slug; facts about it, newest first.' },
-    query: { type: 'string', description: 'Also search pages (results[] arm).' },
+    entity: { type: 'string', description: 'Entity slug; its facts.' },
+    question: { type: 'string', description: 'Rank facts by relevance to it.' },
+    query: { type: 'string', description: 'Also search pages (results[]).' },
     budget_tokens: { type: 'number', description: 'Token budget; facts pack first.' },
-    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'facts_first (default) or query_first.' },
-    source_id: { type: 'string', description: 'Narrow to one source you may read.' },
-    since: { type: 'string', description: 'Facts since (ISO 8601 or "8 hours ago").' },
-    session_id: { type: 'string', description: 'Facts captured in this session.' },
-    include_expired: { type: 'boolean', description: 'Include expired facts.' },
-    supersessions: { type: 'boolean', description: 'Only the supersession audit log.' },
+    budget_policy: { type: 'string', enum: ['facts_first', 'query_first'], description: 'Default facts_first.' },
+    source_id: { type: 'string', description: 'One readable source.' },
+    since: { type: 'string', description: 'ISO 8601 or "8 hours ago".' },
+    session_id: { type: 'string', description: "This session's facts." },
+    include_expired: { type: 'boolean', description: 'Also expired; question ranks them.' },
+    supersessions: { type: 'boolean', description: 'Supersession log only.' },
     limit: { type: 'number', description: 'Per-arm max (default 50, cap 100).' },
-    grep: { type: 'string', description: 'Substring of the fact text.' },
-    include_pending: { type: 'boolean', description: 'Add pending count.' },
-    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'Evidence unit for results[] (see search).' },
-    return_window: { type: 'number', description: 'Window size 1-3.' },
+    grep: { type: 'string', description: 'Text substring.' },
+    include_pending: { type: 'boolean', description: 'Pending count.' },
+    return_unit: { type: 'string', enum: ['chunk', 'window', 'section', 'page', 'auto'], description: 'results[] unit (see search).' },
+    return_window: { type: 'number', description: 'Window 1-3.' },
     min_trust: MIN_TRUST_PARAM,
   },
   scope: 'read',
@@ -276,6 +324,7 @@ const recall: Operation = {
         : scope.sourceId ? [scope.sourceId]
           : [sourceId],
     )];
+    const scalarSource = factSources.length === 1 ? factSources[0] : undefined;
 
     // Visibility filter: remote callers see world-only unless their token
     // grants elevated visibility (future-proofing; v0.31 ships world-only
@@ -284,6 +333,8 @@ const recall: Operation = {
       ctx.remote === false
         ? undefined
         : ['world'] as ('private' | 'world')[];
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote); // #4352: fact and page arms alike
     const eligibility = await resolveReadEligibility(ctx, { minTrust: p.min_trust }); // #5575 floor + quarantine/rederive hiding
 
     type FactRows = Awaited<ReturnType<typeof ctx.engine.listFactsByEntity>>;
@@ -326,29 +377,36 @@ const recall: Operation = {
       throw verbError(
         'invalid_params',
         `since is not a parseable timestamp or duration: "${String(p.since).slice(0, 60)}"`,
-        'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, or a duration such as "8 hours ago" / "2d".',
+        'Pass an ISO 8601 datetime (e.g. "2026-08-11T00:00:00Z"), Unix epoch millis, a duration such as "8 hours ago" / "2d", or a relative phrase such as "6 weeks ago" / "last month".',
       );
     }
+    const question = parseQuestionParam(p);
     const entityParam = typeof p.entity === 'string' && p.entity.length > 0 ? (p.entity as string) : null;
     const sessionParam = typeof p.session_id === 'string' && p.session_id.length > 0 ? (p.session_id as string) : null;
+    let ranking: QuestionRecall | null = null;
     // Shared per-source opts for the fact-list arms (visibility, grep and the
     // audit exclusion all filter at the ENGINE level, before each source's
     // LIMIT, so a hidden newest row never consumes a slot).
     const listOpts = {
       activeOnly: !includeExpired,
       limit,
-      visibility,
+      visibility, excludePrivate,
       grep: grep ?? undefined,
       excludeAuditRows: true, eligibility,
     };
 
-    if (p.supersessions === true) {
+    if (question !== null) {
+      ranking = await rankFactsByQuestion(ctx, { question, params: p, factSources, limit, entity: entityParam, sessionId: sessionParam, since, grep, includeExpired,
+        scope: { sourceIds: factSources, remote: ctx.remote !== false, excludePrivate, minTrust: eligibility.floor, suppressFlagged: eligibility.suppressFlagged } });
+      ({ rows, ambiguousEntity } = ranking);
+      for (const notice of questionRecallNotices(ranking, ctx.brainId)) ctx.emitNotice?.(notice);
+    } else if (p.supersessions === true) {
       // Visibility filters at the ENGINE level (before each source's LIMIT),
       // same as the sibling fact-list arms — a post-merge filter would let a
       // private newest row consume a limit slot and hide an older world row.
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
-          ctx.engine.listSupersessions(src, { since: since ?? undefined, limit, visibility, eligibility }),
+          ctx.engine.listSupersessions(src, { since: since ?? undefined, limit, visibility, excludePrivate, eligibility }),
         )),
         // v0.46 (#3014): matches the engine's ORDER BY COALESCE(expired_at,
         // valid_until) — ontology supersessions carry valid_until only.
@@ -362,22 +420,22 @@ const recall: Operation = {
       // in this session) since T" is a question about when the underlying
       // events occurred, not about when a batch extraction wrote the rows.
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
-      const lists = await Promise.all(factSources.map(async (src) => {
-        const entitySlug = entityParam
-          ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam)
-          : undefined;
-        return ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug, sessionId: sessionParam ?? undefined });
+      const resolvedLists = await Promise.all(factSources.map(async (src) => {
+        const entitySlug = entityParam ? ((await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam) : undefined;
+        const rows = await readEntityFacts(ctx, src, entitySlug, limit,
+          s => ctx.engine.listFactsSince(src, since, { ...listOpts, eventTime: true, entitySlug: s, sessionId: sessionParam ?? undefined }));
+        return { slug: entitySlug, rows };
       }));
-      ambiguousEntity = entityParam ? await unlinkedNamesakes(ctx.engine, lists) : null;
-      rows = ambiguousEntity ? [] : mergeNewest(lists, byEventTime);
+      ambiguousEntity = entityParam ? await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug ?? r.entity_slug })))) : null;
+      rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), byEventTime);
     } else if (entityParam) {
       const { resolveEntitySlug } = await import('../entities/resolve.ts');
-      const lists = await Promise.all(factSources.map(async (src) => {
+      const resolvedLists = await Promise.all(factSources.map(async (src) => {
         const slug = (await resolveEntitySlug(ctx.engine, src, entityParam)) ?? entityParam;
-        return ctx.engine.listFactsByEntity(src, slug, listOpts);
+        return { slug, rows: await readEntityFacts(ctx, src, slug, limit, s => ctx.engine.listFactsByEntity(src, s!, listOpts)) };
       }));
-      ambiguousEntity = await unlinkedNamesakes(ctx.engine, lists);
-      rows = ambiguousEntity ? [] : mergeNewest(lists, (rec) => rec.valid_from ?? rec.created_at);
+      ambiguousEntity = await unlinkedNamesakes(ctx.engine, resolvedLists.map(l => l.rows.map(r => ({ ...r, entity_slug: l.slug }))));
+      rows = ambiguousEntity ? [] : mergeNewest(resolvedLists.map(l => l.rows), (rec) => rec.valid_from ?? rec.created_at);
     } else if (sessionParam) {
       rows = mergeNewest(
         await Promise.all(factSources.map(src =>
@@ -440,10 +498,12 @@ const recall: Operation = {
         ? Math.floor(p.budget_tokens)
         : null;
 
+    if (queryText && question === null && !entityParam && !sessionParam && !since && p.supersessions !== true) ctx.emitNotice?.(recallHintNotice(p, queryText));
     let searchResults: SearchResult[] = [];
     let searchDegraded: string | undefined;
     let delivery: DeliveryMeta | undefined;
     const evidencePlan = queryText ? await recallEvidencePlan(ctx, p) : null;
+    const rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = evidencePlan?.rankCut ? { pageRankCut: evidencePlan.rankCut } : {};
     if (queryText) {
       // #3242 parity (#4707): the page-search arm widens an unqualified
       // no-grant caller across the transport-computed federated set, exactly
@@ -452,12 +512,10 @@ const recall: Operation = {
       // source was invisible to recall while visible to every sibling read op.
       const searchScope = { ...federatedSearchScope(ctx, sourceIdParam), ...(eligibility.floor ? { minTrust: eligibility.floor } : {}) };
       // #4352 — recall's page-search arm enforces `visibility: private` for
-      // untrusted callers (matches the facts arms' world-only filter above).
-      const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
-      const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+      // untrusted callers with the excludePrivate resolved above.
       const keywordOnly = await recallKeywordOnlyReason(ctx);
       if (keywordOnly) {
-        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope);
+        searchResults = await keylessRecallRows(ctx, queryText, limit, excludePrivate, searchScope, rankCutOpts);
         searchDegraded = keywordOnly;
       } else {
         searchResults = await hybridSearchCached(ctx.engine, queryText, {
@@ -467,10 +525,11 @@ const recall: Operation = {
           requireSafeChunks: ctx.remote !== false,
           takesHoldersAllowList: readHolders(ctx),
           ...searchScope,
+          ...rankCutOpts,
         });
       }
       bumpLastRetrievedAt(ctx.engine, searchResults.map(r => r.page_id));
-      const applied = effectivePlan(evidencePlan, searchResults);
+      const applied = recallDeliveryPlan(effectivePlan(evidencePlan, searchResults), p.budget_policy, queryText, budgetTokens, rows);
       if (applied) ({ results: searchResults, delivery } = await deliverEvidence(ctx.engine, searchResults, applied, { ...searchScope, excludePrivate, requireSafeChunks: ctx.remote !== false }));
       searchResults = await stampPageTrust(ctx.engine, searchResults, eligibility.floor);
     }
@@ -487,7 +546,7 @@ const recall: Operation = {
     const queryFirst = p.budget_policy === 'query_first' && queryText !== null && budgetTokens !== null;
     if (queryFirst) {
       const resultsPack = budgetTokens > 0
-        ? packToBudget(searchResults, resultTokens, budgetTokens)
+        ? packToBudget(searchResults, recallResultCost(delivery), budgetTokens)
         : { items: [] as SearchResult[], meta: { used: 0, dropped: searchResults.length } };
       packedResults = resultsPack.items;
       const remaining = budgetTokens - resultsPack.meta.used;
@@ -503,30 +562,17 @@ const recall: Operation = {
       const remaining = budgetTokens - factsPack.meta.used;
       const resultsPack =
         remaining > 0
-          ? packToBudget(searchResults, resultTokens, remaining)
+          ? packToBudget(searchResults, recallResultCost(delivery), remaining)
           : { items: [] as SearchResult[], meta: { budget: 0, used: 0, dropped: searchResults.length, kept: 0 } };
       packedResults = resultsPack.items;
       budgetUsed = factsPack.meta.used + resultsPack.meta.used;
       droppedCount = factsPack.meta.dropped + resultsPack.meta.dropped;
     }
 
-    const budgetPacking = p.budget_policy === 'facts_first' || p.budget_policy === 'query_first'
-      ? {
-          policy: queryFirst ? 'query_first' : 'facts_first',
-          applied: budgetTokens !== null && (queryFirst || (p.budget_policy === 'facts_first' && budgetTokens > 0)),
-          reason: p.budget_policy === 'query_first' && !queryText ? 'no_query'
-            : budgetTokens === null ? 'no_positive_finite_budget'
-              : budgetTokens === 0 ? 'budget_below_one'
-                : rows.length + searchResults.length === 0 ? 'no_candidates'
-                  : packedFacts.length + packedResults.length === 0 ? 'first_items_exceed_budget'
-                    : 'packed',
-          facts: packingArm(rows, packedFacts, r => estimateTokens(r.fact)),
-          results: packingArm(searchResults, packedResults, resultTokens),
-        }
-      : undefined;
+    const budgetPacking = recallBudgetPacking(p.budget_policy, queryText, budgetTokens, { rows, packedFacts, searchResults, packedResults }, recallResultCost(delivery));
 
-    return {
-      facts: await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
+    const out = {
+      facts: await withFactDateHeaders(ctx.engine, await stampRowTrust(ctx.engine, 'facts', packedFacts.map(r => ({ // #5575 A6: + trust_tier, origin, unconfirmed
         id: r.id,
         fact: r.fact,
         kind: r.kind,
@@ -556,8 +602,12 @@ const recall: Operation = {
         // is the protocol name for the stored source attribution.
         fact_id: String(r.id),
         provenance: r.source, ...(r.attributed_to ? { attributed_to: r.attributed_to } : {}),
-      })), f => f.id),
+        ...(ranking ? { relevance: ranking.relevance.get(r.id) } : {}),
+      })), f => f.id)),
       total: packedFacts.length,
+      facts_order: ranking ? 'relevance' : 'newest',
+      ...(ranking?.degraded ? { facts_degraded: ranking.degraded } : {}),
+      ...(ranking?.calibration ? { facts_calibration: ranking.calibration } : {}),
       ...(ambiguousEntity ? { ambiguous_entity: { candidates: ambiguousEntity, suggestion: AMBIGUOUS_ENTITY_SUGGESTION } } : {}),
       ...(pending_consolidation_count !== undefined ? { pending_consolidation_count } : {}),
       // MEMORY_VERBS v1 envelope (G1B superset — additive on every response).
@@ -571,6 +621,8 @@ const recall: Operation = {
               evidence: r.evidence,
               create_safety: r.create_safety,
               provenance: r.slug,
+              // #4830: a row without a source takes the scope's single source; a federated read leaves it absent.
+              ...((r.source_id ?? scalarSource) ? { source_id: r.source_id ?? scalarSource } : {}),
               ...(r.delivered ? { delivered: r.delivered } : {}),
               ...(r.relational ? { relational: r.relational } : {}),
               ...(r.trust_tier ? { trust_tier: r.trust_tier, origin: r.origin, ...(r.unconfirmed ? { unconfirmed: true } : {}) } : {}),
@@ -585,28 +637,25 @@ const recall: Operation = {
       ...(budgetPacking ? { budget_packing: budgetPacking } : {}),
       ...(delivery ? { delivery } : {}),
     };
+    recordRecallOutcome(out);
+    return out;
   },
 };
 
-type EntityCandidate = { source_id: string; entity_slug: string };
-const AMBIGUOUS_ENTITY_SUGGESTION = 'These are different entities in different sources. Pass source_id to read one, or link them with entity_identity_link if they are the same.';
-
 /**
- * The identity key is (source_id, slug): an entity name resolved in several
- * granted sources names different entities unless an entity-identity group
- * links their pages. Merging them would hand the caller a stranger's facts,
- * so federated recall refuses unlinked namesakes and names the candidates.
- * Returns null when the per-source fact lists are one entity.
+ * One source's facts about an entity, read under every slug they may be saved
+ * under (the page, its identity siblings and its bare subject slug,
+ * mentions/siblings.ts), newest event first, cut at `limit`.
  */
-async function unlinkedNamesakes(engine: BrainEngine, lists: FactRow[][]): Promise<EntityCandidate[] | null> {
-  const candidates = [...new Map(lists.flat().map((r): [string, EntityCandidate] =>
-    [`${r.source_id}:${r.entity_slug}`, { source_id: r.source_id, entity_slug: r.entity_slug as string }])).values()];
-  if (candidates.length < 2) return null;
-  const { identityIdsForPages } = await import('../entity-identity.ts');
-  const ids = await identityIdsForPages(engine, candidates.map(c => ({ sourceId: c.source_id, slug: c.entity_slug })));
-  const groups = new Set(candidates.map(c => ids.get(`${c.source_id}:${c.entity_slug}`) ?? null));
-  return groups.size === 1 && !groups.has(null) ? null : candidates;
+async function readEntityFacts<R extends { valid_from?: Date | string | null; created_at?: Date | string | null }>(ctx: OperationContext, src: string,
+  slug: string | undefined, limit: number, read: (slug: string | undefined) => Promise<R[]>): Promise<R[]> {
+  const { factEntitySlugs } = await import('../mentions/siblings.ts');
+  const slugs = slug ? await factEntitySlugs(ctx.engine, src, slug, { excludePrivate: ctx.remote !== false }).catch(() => [slug]) : [undefined];
+  const time = (r: R) => { const v = r.valid_from ?? r.created_at; return (v instanceof Date ? v.getTime() : v ? Date.parse(String(v)) : 0) || 0; };
+  return (await Promise.all(slugs.map(read))).flat().sort((a, b) => time(b) - time(a)).slice(0, limit);
 }
+
+const AMBIGUOUS_ENTITY_SUGGESTION = 'These are different entities in different sources. Pass source_id to read one, or link them with entity_identity_link if they are the same.';
 
 /** Parse an `entities` param (comma-string or array) to a trimmed name list. */
 function parseEntityList(v: unknown): string[] {
@@ -636,6 +685,9 @@ async function withProvenance<T extends { id: number }>(engine: BrainEngine, sou
   return facts.map((f) => ({ ...f, provenance: byId.get(f.id) ?? null }));
 }
 
+/** context_pack `intent` values; pinned equal to proactive-brief.ts BRIEF_INTENTS by test (kept literal so this module stays import-light). */
+export const BRIEF_INTENTS = ['meeting', 'reply'] as const;
+
 const context_pack: Operation = {
   name: 'context_pack',
   mutating: false,
@@ -645,11 +697,13 @@ const context_pack: Operation = {
   params: {
     entities: { type: 'string', description: 'Comma-separated names or slugs (max 8).' },
     budget_tokens: { type: 'number', description: 'Token budget; cards pack first.' },
-    since: { type: 'string', description: 'Only open-thread events after this ISO time.' },
+    since: { type: 'string', description: 'Open-thread events after this ISO time.' },
     session_id: { type: 'string', description: 'Opaque session id.' },
     include_private: { type: 'boolean', description: 'Local trusted callers only.' },
     min_trust: MIN_TRUST_PARAM,
     include_quarantined: { type: 'boolean', description: 'Admin or memory_confirm: quarantined cards.', fullSurfaceOnly: true },
+    counterparty: { type: 'string', description: 'Person or company (name or slug): adds a pulled brief of dated items about them.', fullSurfaceOnly: true },
+    intent: { type: 'string', enum: [...BRIEF_INTENTS], description: 'With counterparty: the task the brief is for.', fullSurfaceOnly: true },
   },
   scope: 'read',
   verb: true,
@@ -683,6 +737,12 @@ const context_pack: Operation = {
         : null;
     // #5575 (CEO-20, CEO-18): a proactive surface under the connection's floor.
     const eligibility = await proactiveEligibility(ctx, 'context_pack', { minTrust: p.min_trust });
+    const includeQuarantined = p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE));
+    // Wave 5 D5 pull brief: only when the caller names a counterparty (the
+    // push switch is not read; nothing changes for a caller that does not
+    // pass it). Open loops are trusted-local only; the change arm is
+    // world-only unless a trusted caller widened with include_private.
+    const pullBrief = await contextPackBrief(ctx, p, { sourceId, includePrivate, eligibility });
     const res = entities.length === 0
       ? { cards: [], facts: [], text: '', pointers: [], factsCount: 0 } as unknown as Awaited<ReturnType<typeof assembleContextPack>>
       : await assembleContextPack(ctx.engine, {
@@ -694,7 +754,7 @@ const context_pack: Operation = {
         maxEntities: PACK_DEFAULT_MAX_ENTITIES,
         eligibility,
         // #5575 ENG-15: same rule as get_page: quarantined cards only on an authorized explicit ask.
-        includeQuarantined: p.include_quarantined === true && (ctx.remote === false || hasScope(ctx.auth?.scopes ?? [], 'admin') || hasScope(ctx.auth?.scopes ?? [], MEMORY_CONFIRM_SCOPE)),
+        includeQuarantined,
       });
     // Always-loaded core tier (core-memory.ts): owner-designated pages of
     // `default` plus this source, inside the caller's grant; it packs first.
@@ -711,7 +771,28 @@ const context_pack: Operation = {
     // Pack, price and render the redacted presentation sets (one echo
     // dictionary); local callers get the delivered facts back raw below.
     const rawFacts = await withProvenance(ctx.engine, sourceId, res.facts ?? []);
-    const view = redactRetrievalOutput([{ cards: res.cards ?? [], facts: rawFacts }], {}).results[0];
+    // F1 records (pull verb only; the ambient push path never reads them): the count and enrolled-type records of each card.
+    const { readPackReferences, renderRecordLines, RECORDS_HEADER } = await import('../verbs/entity-references.ts');
+    type PackRefs = Awaited<ReturnType<typeof readPackReferences>>;
+    const packRefs: PackRefs = await readPackReferences(ctx.engine, sourceId, res.cards ?? [], { remote: !includePrivate, eligibility, surfaceCeiling: ctx.surfaceCeiling,
+      emitNotice: (n) => ctx.emitNotice?.(n) })
+      .catch((): PackRefs => ({ bySlug: new Map(), notice: null }));
+    if (packRefs.notice) ctx.emitNotice?.(packRefs.notice);
+    // F3 (`entity.row_page_status`, default on): each card and newer-mentions row carries its page's frontmatter `status` (pull verb only).
+    const { readRowPageStatus } = await import('../entity-references-config.ts');
+    const { readPageStatusByRef } = await import('../mentions/referrers.ts');
+    const statusRefs = (res.cards ?? []).flatMap((c) => [c.entity.slug, ...(c.newer_mentions?.rows ?? []).map((r) => r.slug)]).map((slug) => ({ source_id: sourceId, slug }));
+    const { resolveExcludePrivatePages } = await import('../search/private-visibility.ts');
+    const pageStatus = statusRefs.length && await readRowPageStatus(ctx.engine)
+      ? await readPageStatusByRef(ctx.engine, statusRefs, { excludePrivate: await resolveExcludePrivatePages(ctx.engine, includePrivate ? false : undefined), includeQuarantined })
+        .catch(() => new Map<string, string>())
+      : new Map<string, string>();
+    const statusOf = (slug: string) => { const value = pageStatus.get(`${sourceId}:${slug}`); return value ? { page_status: value } : {}; };
+    const withRefs = (res.cards ?? []).map((c) => ({
+      ...c, ...packRefs.bySlug.get(c.entity.slug), ...statusOf(c.entity.slug),
+      ...(c.newer_mentions ? { newer_mentions: { ...c.newer_mentions, rows: c.newer_mentions.rows.map((r) => ({ ...r, ...statusOf(r.slug) })) } } : {}),
+    }));
+    const view = redactRetrievalOutput([{ cards: withRefs, facts: rawFacts }], {}).results[0];
     let cards = view.cards;
     let facts = view.facts;
     // The SAME since filter the assembler applied (pre-landing review: the raw
@@ -724,7 +805,7 @@ const context_pack: Operation = {
     if (budgetTokens !== null) {
       // #4761: reserve the envelope + headers, then price each card as its
       // rendered line plus its rendered (since-filtered) thread lines.
-      const itemBudget = budgetTokens - packHeaderCost() - coreTokens;
+      const itemBudget = budgetTokens - packHeaderCost() - coreTokens - (pullBrief?.text ? estimateTokens(pullBrief.text) : 0);
       const cardCost = (c: (typeof cards)[number]) =>
         lineCost(renderCardLine(c)) + threadsOf(c).reduce((n, t) => n + lineCost(renderThreadLine(t)), 0);
       const cardPack = itemBudget > 0 ? packToBudget(cards, cardCost, itemBudget) : dropAll(cards);
@@ -740,6 +821,14 @@ const context_pack: Operation = {
         : dropAll(withMentions);
       const keptMentions = new Set(mentionPack.items);
       cards = cards.map((c) => (c.newer_mentions && !keptMentions.has(c) ? { ...c, newer_mentions: undefined } : c));
+      // Records pack last, into what everything else left; a card whose records do not fit keeps its count.
+      const recordBudget = mentionBudget - mentionPack.meta.used - lineCost('') - lineCost(RECORDS_HEADER);
+      const withRecords = cards.filter((c) => renderRecordLines(c).length);
+      const recordPack = recordBudget > 0
+        ? packToBudget(withRecords, (c) => renderRecordLines(c).reduce((n, l) => n + lineCost(l), 0), recordBudget)
+        : dropAll(withRecords);
+      const keptRecords = new Set(recordPack.items);
+      cards = cards.map((c) => (renderRecordLines(c).length && !keptRecords.has(c) ? { ...c, records: undefined, sibling_records: undefined } : c));
       droppedCount = cardPack.meta.dropped + factPack.meta.dropped;
     }
     const open_threads = cards.flatMap(threadsOf);
@@ -747,8 +836,10 @@ const context_pack: Operation = {
     // `text` is what harnesses inject, so it must honor the same budget the
     // structured arrays report — the assembler's pre-budget rendering would
     // overrun the declared budget_tokens. budget_used reports that text.
-    const packText = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
-    const text = [coreText, packText].filter(Boolean).join('\n\n');
+    const recordLines = cards.flatMap(renderRecordLines);
+    const basePack = entities.length === 0 ? '' : budgetTokens !== null ? renderPack(cards, open_threads, facts) : res.text;
+    const packText = recordLines.length ? [basePack, ['', RECORDS_HEADER, ...recordLines].join('\n')].filter(Boolean).join('\n') : basePack;
+    const text = [coreText, pullBrief?.text ?? '', packText].filter(Boolean).join('\n\n');
     const budgetUsed = budgetTokens !== null ? estimateTokens(text) : undefined;
 
     return {
@@ -758,6 +849,7 @@ const context_pack: Operation = {
         slug: c.entity.slug,
         title: c.entity.title,
         type: c.entity.type,
+        ...(c.page_status ? { page_status: c.page_status } : {}),
         summary: c.quarantined && c.summary ? renderTrustedText(c.summary, { trust_tier: 'external_untrusted', origin: 'quarantined' }) : c.summary,
         open_threads: c.open_threads,
         edges: c.edges,
@@ -767,6 +859,10 @@ const context_pack: Operation = {
         ...(c.quarantined ? { quarantined: true } : {}),
         ...(c.unconfirmed ? { unconfirmed: true } : {}),
         ...(c.newer_mentions ? { newer_mentions: c.newer_mentions } : {}),
+        ...(c.referenced_by_count !== undefined ? { referenced_by_count: c.referenced_by_count } : {}),
+        ...(c.records ? { records: c.records } : {}),
+        ...(c.sibling_records ? { sibling_records: c.sibling_records } : {}),
+        ...(c.references_unavailable ? { references_unavailable: c.references_unavailable } : {}),
       })),
       open_threads,
       facts: (ctx.remote === false ? rawFacts.slice(0, facts.length) : facts).map((f) => ({
@@ -783,6 +879,7 @@ const context_pack: Operation = {
         ...(f.trust_tier ? { trust_tier: f.trust_tier, origin: f.origin } : {}),
       })),
       text,
+      ...(pullBrief ? { brief: pullBrief.view } : {}),
       ...(withheld ? { suppressed: suppressionSummary(withheld) } : {}),
       ...(core && core.enabled ? { core: { text: core.text, chars_used: core.chars_used, chars_limit: core.chars_limit, pages: core.pages,
         truncated: core.truncated, revision: core.revision } } : {}),
@@ -790,9 +887,58 @@ const context_pack: Operation = {
       ...(budgetTokens !== null
         ? { budget_tokens: budgetTokens, budget_used: budgetUsed, dropped_count: droppedCount }
         : {}),
+      // C4: optional pinned answers (fresh sentences) and the withheld count (src/core/questions/service.ts).
+      ...(await (await import('../questions/service.ts')).pinnedAnswersForPack(ctx, [...new Set([...(res.cards ?? []).map((c) => c.entity.slug), ...entities])])
+        .catch(() => null)),
     };
   },
 };
+
+/**
+ * context_pack's pull brief (wave 5 D5): null unless `counterparty` is given.
+ * An unresolved counterparty is a labelled empty brief, not an error; an
+ * invalid `intent` is invalid_params.
+ */
+async function contextPackBrief(
+  ctx: OperationContext,
+  p: Record<string, unknown>,
+  opts: { sourceId: string; includePrivate: boolean; eligibility: import('../eligibility/policy.ts').ReadEligibility },
+): Promise<{ text: string; view: Record<string, unknown> } | null> {
+  if (typeof p.counterparty !== 'string' || !p.counterparty.trim()) return null;
+  if (p.intent !== undefined && !(BRIEF_INTENTS as readonly unknown[]).includes(p.intent)) {
+    throw verbError(
+      'invalid_params',
+      `context_pack: intent must be one of ${BRIEF_INTENTS.join(', ')}`,
+      `Pass ${paramUse(ctx, 'intent', 'meeting')} or omit it.`,
+    );
+  }
+  const { resolvePullCounterparty, assembleBrief, briefView } = await import('../context/proactive-brief.ts');
+  const local = ctx.remote === false;
+  const label = {
+    delivery: 'pull' as const,
+    intent: (p.intent as string | undefined) ?? null,
+    ...(local ? {} : { withheld_arms: ['loops'] }),
+  };
+  const cp = await resolvePullCounterparty(ctx.engine, opts.sourceId, p.counterparty.slice(0, 200), {
+    excludePrivate: !opts.includePrivate, eligibility: opts.eligibility,
+  });
+  if (!cp) return { text: '', view: { ...label, counterparty: null, items: [], reason: 'counterparty_unresolved' } };
+  const now = Date.now();
+  const brief = await assembleBrief(ctx.engine, {
+    trigger: 'pull',
+    counterparties: [cp],
+    local,
+    includePrivate: opts.includePrivate,
+    eligibility: opts.eligibility,
+    clock: { now, stopAt: now + CONTEXT_PACK_BRIEF_BUDGET_MS },
+  });
+  const counterparty = { slug: cp.slug, display: cp.display };
+  if (!brief) return { text: '', view: { ...label, counterparty, items: [], reason: 'no_items' } };
+  return { text: brief.text, view: { ...label, counterparty, items: briefView(brief).items } };
+}
+
+/** Wall-clock cap on the pull brief's queries. */
+const CONTEXT_PACK_BRIEF_BUDGET_MS = 1000;
 
 const delta: Operation = {
   name: 'delta',
@@ -1196,7 +1342,9 @@ const forget_fact: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'forget_fact', id: p.id };
     const { submitForgetMutation } = await import('../persistence/memory-mutations.ts');
-    return submitForgetMutation(ctx, 'forget_fact', p);
+    const out = await submitForgetMutation(ctx, 'forget_fact', p);
+    recordFunnelEvent('withdrawal');
+    return out;
   },
 };
 
@@ -1215,10 +1363,11 @@ export function clampRecallLimit(raw: unknown): number {
 
 /**
  * Parse a `since` parameter into a Date. Accepts ISO 8601, plain duration
- * shorthand ("8 hours ago", "3 days ago", "30m", "1h", "2d", "7d"), or
- * Unix epoch millis. Returns null on unparseable input.
+ * shorthand ("8 hours ago", "3 days ago", "30m", "1h", "2d", "7d"), Unix
+ * epoch millis, or a relative phrase (since-parse.ts: "6 weeks ago",
+ * "last month"). Returns null on unparseable input.
  */
-function parseSinceParam(raw: unknown): Date | null {
+export function parseSinceParam(raw: unknown): Date | null {
   if (raw == null) return null;
   if (typeof raw === 'number' && Number.isFinite(raw)) return new Date(raw);
   if (typeof raw !== 'string') return null;
@@ -1241,7 +1390,7 @@ function parseSinceParam(raw: unknown): Date | null {
       n * 24 * 60 * 60 * 1000;
     return new Date(Date.now() - ms);
   }
-  return null;
+  return parseRelativeSince(s);
 }
 
 /**
@@ -1307,11 +1456,12 @@ async function recallKeywordOnlyReason(ctx: OperationContext): Promise<string | 
 async function keylessRecallRows(
   ctx: OperationContext, queryText: string, limit: number, excludePrivate: boolean,
   searchScope: { sourceId?: string; sourceIds?: string[]; minTrust?: TrustTier },
+  rankCutOpts: Pick<HybridSearchOpts, 'pageRankCut'> = {},
 ): Promise<SearchResult[]> {
   if (await keylessChainQuestion(ctx, queryText)) {
     return hybridSearchCached(ctx.engine, queryText, {
       limit, expansion: false, excludePrivate, requireSafeChunks: ctx.remote !== false,
-      takesHoldersAllowList: readHolders(ctx), ...searchScope,
+      takesHoldersAllowList: readHolders(ctx), ...searchScope, ...rankCutOpts,
     });
   }
   const rows = dedupResults(await ctx.engine.searchKeyword(queryText, { limit, excludePrivate, requireSafeChunks: ctx.remote !== false, ...searchScope }));

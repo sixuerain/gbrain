@@ -25,7 +25,9 @@ import {
 } from './proposals.ts';
 import { tierRaiseFix } from './confirm.ts';
 import { queueTierProjection } from './page-write.ts';
+import { propagateTierLowering } from './propagation.ts';
 import { compareTrust, effectiveWriteTrust, storedTrustTier, trustRankSql, type TrustTier, type WriteTrust } from './tier.ts';
+import { privateProvenanceFilterFragment } from '../search/private-visibility.ts';
 
 /** I3: a write at `writer` may supersede, expire or forget a row at `target` only when it is at least as trusted. */
 export function supersessionGuarded(writer: TrustTier | null | undefined, target: unknown): boolean {
@@ -108,8 +110,8 @@ export async function forgetRequiresOwner(engine: BrainEngine, input: { sourceId
 }
 
 /** Pre-admission check for a remote forget: a guarded target becomes a `forget` proposal and the verb error. */
-export async function guardRemoteForget(engine: BrainEngine, input: { sourceId: string; factId: number; principal: Principal; reason: string | null }): Promise<void> {
-  const [fact] = await engine.executeRaw<{ trust_tier: string }>(`SELECT trust_tier FROM facts WHERE id = $1 AND source_id = $2 AND visibility = 'world'`, [input.factId, input.sourceId]);
+export async function guardRemoteForget(engine: BrainEngine, input: { sourceId: string; factId: number; principal: Principal; reason: string | null; excludePrivate?: boolean }): Promise<void> {
+  const [fact] = await engine.executeRaw<{ trust_tier: string }>(`SELECT trust_tier FROM facts WHERE id = $1 AND source_id = $2 AND visibility = 'world'${input.excludePrivate ? ` AND ${privateProvenanceFilterFragment('facts')}` : ''}`, [input.factId, input.sourceId]);
   if (!fact || !supersessionGuarded('agent_written', fact.trust_tier)) return;
   throw await forgetRequiresOwner(engine, { ...input, factTier: storedTrustTier(fact.trust_tier), writerTier: 'agent_written' });
 }
@@ -188,6 +190,8 @@ export const TRUST_PAIR_STORE: PairProposalStore = {
     const prior = storedTrustTier((row?.before_state.new as { tier?: unknown } | undefined)?.tier);
     await tx.executeRaw(`UPDATE facts SET trust_tier = $3 WHERE id = $1 AND source_id = $2`, [proposal.new_fact_id, proposal.source_id, prior]);
     for (const id of [proposal.old_fact_id, proposal.new_fact_id]) await queueTierProjection(tx, 'facts', id);
+    // W1 #6783 §12 (b): what was derived from the confirmed row while it was confirmed follows it back down.
+    await propagateTierLowering(tx, [{ table: 'facts', id: proposal.new_fact_id }]);
   },
 };
 
@@ -284,9 +288,13 @@ registerTrustProposalHandler('supersede_take', {
   },
 });
 
-/** The owner applies the forget a remote caller asked for, as a trusted local forget. */
+/** The owner applies the forget a remote caller asked for, as a trusted local forget; a held take or timeline row takes the page's text (trust/held-removals.ts). */
 registerTrustProposalHandler('forget', {
   async accept(engine, proposal, ctx: TrustDecisionContext) {
+    if (proposal.target_table !== 'facts') {
+      const { acceptHeldRemoval } = await import('./held-removals.ts');
+      return acceptHeldRemoval(engine, proposal, ctx);
+    }
     const { submitForgetMutation } = await import('../persistence/memory-mutations.ts');
     const local = { engine, sourceId: proposal.source_id, remote: false as const, dryRun: false,
       config: ctx.config ?? ({ engine: engine.kind } as never), logger: { info() {}, warn() {}, error() {} } };

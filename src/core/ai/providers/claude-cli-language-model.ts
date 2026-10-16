@@ -34,7 +34,7 @@
  * (gateway.toolLoop primarily) use doGenerate.
  */
 import { randomUUIDv7 } from 'bun';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from '../../spawn.ts';
 import { mkdirSync } from 'node:fs';
 import {
   claudeCliConfigDir,
@@ -186,6 +186,36 @@ function parseResultEnvelope(stdout: string): EnvelopeParse {
  * surfacing `api_error_status` + the human-readable `result` message instead of
  * an opaque blob.
  */
+/**
+ * #6523: Claude Code reports a response that hit CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ * (the cap #6424 forwards, or the CLI's own default) as an error envelope,
+ * not as a success with `stop_reason: 'max_tokens'`:
+ *   "API Error: Claude's response exceeded the 2048 output token maximum. To
+ *    configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS
+ *    environment variable."
+ * Rejecting on it hid the cap from every caller that escalates on `length`
+ * (loops_extract 2048 → 8192, facts/extract 1× → 2×), so the minion queue
+ * retried the same capped call and the job died. The match is the anchored
+ * prefix only: the trailing advice has already changed wording once, the
+ * reported cap may be the default rather than the forwarded one, and the exit
+ * code varies by CLI version. A quoted prefix mid-answer, a success envelope,
+ * a non-string result or an envelope carrying an API status never match.
+ */
+const OUTPUT_CAP_RE = /^API Error: Claude's response exceeded the \d+ output token maximum\b/;
+
+function isOutputCapEnvelope(envelope: ClaudeJsonResult): boolean {
+  return envelope.type === 'result'
+    && envelope.is_error === true
+    && envelope.api_error_status === undefined
+    && typeof envelope.result === 'string'
+    && OUTPUT_CAP_RE.test(envelope.result);
+}
+
+/** The cap envelope as the success the API would have returned: no text, `max_tokens`, usage as reported. */
+function outputCapAsLength(envelope: ClaudeJsonResult): ClaudeJsonResult {
+  return { ...envelope, is_error: false, result: '', stop_reason: 'max_tokens' };
+}
+
 function envelopeError(envelope: ClaudeJsonResult, exitCode: number | undefined): ClaudeCliProcessError {
   const status = typeof envelope.api_error_status === 'number' ? envelope.api_error_status : undefined;
   const detail = envelope.result || envelope.subtype;
@@ -337,8 +367,17 @@ function runClaude(
   userPrompt: string,
   model: string,
   signal?: AbortSignal,
+  maxOutputTokens?: number,
 ): Promise<ClaudeJsonResult> {
   return new Promise((resolve, reject) => {
+    // #6424: forward the call's output cap. The inline --settings env sits
+    // above the user's settings.json env block, so both carry it.
+    const outputCap = typeof maxOutputTokens === 'number' && Number.isInteger(maxOutputTokens) && maxOutputTokens > 0
+      ? String(maxOutputTokens)
+      : undefined;
+    const settings = outputCap
+      ? JSON.stringify({ disableAllHooks: true, env: { CLAUDE_CODE_MAX_OUTPUT_TOKENS: outputCap } })
+      : '{"disableAllHooks":true}';
     const args = [
       '--print',
       '--output-format', 'json',
@@ -357,7 +396,7 @@ function runClaude(
       // extracting it spawns another call. Unlike --bare this keeps the
       // subscription login (credentials are not settings). Accepted by every
       // CLI that accepts the flags above.
-      '--settings', '{"disableAllHooks":true}',
+      '--settings', settings,
     ];
     if (systemPrompt) {
       args.push('--system-prompt', systemPrompt);
@@ -390,6 +429,7 @@ function runClaude(
     // see resolveHermeticConfigDir for the auth caveat that makes it opt-in.
     const hermeticConfigDir = resolveHermeticConfigDir();
     if (hermeticConfigDir) env.CLAUDE_CONFIG_DIR = hermeticConfigDir;
+    if (outputCap) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = outputCap;
     const child = spawn(claudeBin(), args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: ensureCleanCwd(),
@@ -430,6 +470,10 @@ function runClaude(
         // reason lives in stderr, so it falls through to the blob fallback
         // (as does any stdout without a parseable envelope).
         const attempt = parseResultEnvelope(stdout);
+        if (attempt.ok && isOutputCapEnvelope(attempt.envelope)) {
+          resolve(outputCapAsLength(attempt.envelope));
+          return;
+        }
         if (attempt.ok && attempt.envelope.type === 'result' && attempt.envelope.is_error === true) {
           reject(envelopeError(attempt.envelope, code ?? undefined));
           return;
@@ -458,6 +502,10 @@ function runClaude(
         return;
       }
       const envelope = attempt.envelope;
+      if (isOutputCapEnvelope(envelope)) {
+        resolve(outputCapAsLength(envelope));
+        return;
+      }
       if (envelope.is_error) {
         reject(envelopeError(envelope, 0));
         return;
@@ -661,7 +709,7 @@ export class ClaudeCliLanguageModel implements LanguageModelV2 {
     const toolInstructions = buildToolUseInstructions(options.tools);
     const systemPrompt = [systemText, toolInstructions].filter(s => s.length > 0).join('\n');
 
-    const result = await runClaude(systemPrompt, userPrompt, this.modelId, options.abortSignal);
+    const result = await runClaude(systemPrompt, userPrompt, this.modelId, options.abortSignal, options.maxOutputTokens);
     const { toolCalls, beforeText, afterText } = extractToolCalls(result.result);
 
     const content: LanguageModelV2Content[] = [];

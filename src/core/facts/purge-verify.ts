@@ -15,7 +15,7 @@
  * stored receipt, the effects and a fingerprint probe.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn } from '../spawn.ts';
 import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
@@ -25,6 +25,7 @@ import { gbrainPath } from '../config.ts';
 import type { WriteRequest } from '../persistence/model.ts';
 import { DELETION_INVENTORY, OUT_OF_REACH_RESIDUALS, type InventoryEntry } from '../deletion-inventory.ts';
 import type { PurgePlan, PurgeTarget } from './purge.ts';
+import { gitChildEnv } from '../git-env.ts';
 
 export type StoreCount = Record<string, number>;
 export type StoreStatus = 'deleted' | 'would_remove' | 'retained_inactive' | 'unverified' | 'out_of_reach' | 'out_of_scope' | 'not_present' | 'incomplete';
@@ -46,11 +47,33 @@ export interface PurgeReceipt {
   tell_user_to_run?: { argv: string[]; why: string };
 }
 
+/**
+ * A page or page-version row (alias `a`) still states the claim: in its body,
+ * timeline, title or frontmatter. `$n` is the lowercased claim, `$n+1` its
+ * JSON-escaped form (frontmatter is matched as JSON text).
+ */
+export const carriesClaimSql = (a: string, n: number) => `(strpos(lower(${a}.compiled_truth),$${n})>0 OR strpos(lower(COALESCE(${a}.timeline,'')),$${n})>0
+  OR strpos(lower(COALESCE(${a}.title,'')),$${n})>0 OR strpos(lower(COALESCE(${a}.frontmatter::text,'')),$${n + 1})>0)`;
+export const claimNeedles = (claim: string): [string, string] => [claim.toLowerCase(), JSON.stringify(claim.toLowerCase()).slice(1, -1)];
+
 export const PURGE_PROBE_LIMITS = { rows: 1000, statementMs: 2_000, totalMs: 20_000, gitBytes: 64 * 1024 * 1024, gitMs: 10_000 } as const;
 let probeLimits: { rows: number; statementMs: number; totalMs: number } = { ...PURGE_PROBE_LIMITS };
 /** Test seam: shrink the probe bounds (null restores them). */
 export function __setPurgeProbeLimitsForTests(limits: Partial<typeof probeLimits> | null): void {
   probeLimits = limits ? { ...probeLimits, ...limits } : { ...PURGE_PROBE_LIMITS };
+}
+
+/**
+ * Wave B PR 1: segment text is not probed yet (segment probe in PR 2), so a page-text report over a source
+ * holding segmented pages is `unverified` instead of passing on NULL body columns.
+ */
+async function unprobedSegmentedPages(engine: BrainEngine, sourceId: string, report: StoreReport): Promise<StoreReport> {
+  if (report.status === 'incomplete' || report.status === 'would_remove') return report;
+  const [row] = await engine.executeRaw<{ n: number }>(`SELECT count(*)::int AS n FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND body_storage='segmented'`, [sourceId]);
+  const n = Number(row?.n ?? 0);
+  if (!n) return report;
+  return { ...report, status: 'unverified', reason: 'segmented_body',
+    detail: `${n} page(s) in this source store their body in segments, which this receipt does not search yet; the claim may survive there.` };
 }
 
 type ProbeResult = { count: number } | { unverified: string };
@@ -74,6 +97,8 @@ async function boundedCount(engine: BrainEngine, sql: string, params: unknown[],
 const textMatch = (column: string, at: number) => `(strpos(lower(${column}::text),$${at})>0 OR strpos(lower(${column}::text),$${at + 1})>0)`;
 /** Vector and lexeme columns carry no probe-able text. */
 const PROBE_SKIP = /embedding|search_vector/;
+/** Stores whose probe columns are bytea; their bytes are matched exactly (case-sensitive) against the UTF-8 needle. */
+const BINARY_PROBE_TABLES: ReadonlySet<string> = new Set(['minion_attachments', 'page_segment_texts', 'page_body_staging_parts']);
 
 /** Probe one inventory table for any of `needles` (exact, case-insensitive; JSON also in its escaped form). Scoped to the source when the table has one. */
 async function probeTable(engine: BrainEngine, entry: InventoryEntry, sourceId: string, needles: readonly string[], deadline: number): Promise<ProbeResult> {
@@ -81,8 +106,7 @@ async function probeTable(engine: BrainEngine, entry: InventoryEntry, sourceId: 
   const list = needles.filter(Boolean).slice(0, 32);
   if (!columns.length || !list.length) return { count: 0 };
   const scoped = entry.columns.includes('source_id');
-  // Bytes are matched exactly (case-sensitive) against the UTF-8 needle.
-  const binary = entry.table === 'minion_attachments';
+  const binary = BINARY_PROBE_TABLES.has(entry.table);
   const params: unknown[] = [sourceId];
   const ors: string[] = [];
   for (const needle of list) {
@@ -131,7 +155,7 @@ export async function gitResidualCommits(root: string, paths: readonly string[],
   const needles = [escapeFenceCell(claim).toLowerCase(), claim.toLowerCase()];
   return new Promise(resolve => {
     const child = spawn('git', ['-C', root, '--literal-pathspecs', 'log', '--all', '--format=commit %H %cI', '-p', '--no-color', '--no-ext-diff', '--', ...paths],
-      { stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' } });
+      { stdio: ['ignore', 'pipe', 'ignore'], env: gitChildEnv({ GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' }) });
     const commits: Array<{ commit: string; committed_at: string }> = [];
     let current: { commit: string; committed_at: string } | null = null, bytes = 0, tail = '', bounded: string | null = null;
     const timer = setTimeout(() => { bounded = 'deadline'; child.kill('SIGKILL'); }, limits.ms);
@@ -226,14 +250,14 @@ export async function verifyFactPurge(engine: BrainEngine, input: { target: Purg
     [src, target.visibility, target.fact_hash, plan.subject], plan.factIds.length, removed.facts);
   await swept('takes', `SELECT 1 FROM takes k JOIN pages p ON p.id=k.page_id WHERE p.source_id=$1 AND gbrain_fact_fingerprint(k.claim)=$2 AND ($3='*' OR p.slug=$3)`,
     [src, target.fact_hash, plan.subject], plan.takes.length, removed.takes);
-  const prose = { status: 'out_of_scope' as const, reason: 'source_prose', detail: 'The claim text survives outside a facts fence (page prose); purge the page or edit it to remove it.' };
-  await swept('pages', `SELECT 1 FROM pages WHERE source_id=$1 AND deleted_at IS NULL AND (strpos(lower(compiled_truth),$2)>0 OR strpos(lower(timeline),$2)>0)`,
-    [src, needle], plan.pages.length, removed.pages, prose);
+  const prose = { status: 'out_of_scope' as const, reason: 'source_prose', detail: 'The claim text survives outside a facts fence (page prose, title or frontmatter); purge the page or edit it to remove it.' };
+  await swept('pages', `SELECT 1 FROM pages p WHERE p.source_id=$1 AND p.deleted_at IS NULL AND ${carriesClaimSql('p', 2)}`,
+    [src, ...claimNeedles(claim)], plan.pages.length, removed.pages, prose);
+  stores[stores.length - 1] = await unprobedSegmentedPages(engine, src, stores[stores.length - 1]!);
   await swept('content_chunks', `SELECT 1 FROM content_chunks c JOIN pages p ON p.id=c.page_id WHERE p.source_id=$1 AND strpos(lower(c.chunk_text),$2)>0`,
     [src, needle], plan.pages.length, removed.chunks, prose);
-  await swept('page_versions', `SELECT 1 FROM page_versions v JOIN pages p ON p.id=v.page_id WHERE p.source_id=$1
-      AND (strpos(lower(v.compiled_truth),$2)>0 OR strpos(lower(COALESCE(v.timeline,'')),$2)>0)`,
-    [src, needle], plan.versions, removed.page_versions, { ...prose, items: (input.prose ?? []).slice(0, 20) });
+  await swept('page_versions', `SELECT 1 FROM page_versions v JOIN pages p ON p.id=v.page_id WHERE p.source_id=$1 AND ${carriesClaimSql('v', 2)}`,
+    [src, ...claimNeedles(claim)], plan.versions, removed.page_versions, { ...prose, items: (input.prose ?? []).slice(0, 20) });
   await swept('persistence_requests', `SELECT 1 FROM persistence_requests WHERE source_id=$1 AND (${['intent', 'outcome', 'error_detail', 'error_message']
       .map(c => `strpos(lower(COALESCE(${c}::text,'')),$2)>0 OR strpos(lower(COALESCE(${c}::text,'')),$3)>0`).join(' OR ')})`,
     [src, needle, JSON.stringify(claim).slice(1, -1).toLowerCase()], plan.requests.length, removed.persistence_requests);
@@ -316,6 +340,8 @@ export async function verifyPagePurge(engine: BrainEngine, input: { sourceId: st
   await keyed('facts', 'SELECT 1 FROM facts WHERE source_id=$1 AND source_markdown_slug=$2', [src, slug]);
   for (const table of ['take_proposals', 'open_loops']) await keyed(table, `SELECT 1 FROM ${table} WHERE source_id=$1 AND page_slug=$2`, [src, slug]);
   await keyed('core_edit_notices', 'SELECT 1 FROM core_edit_notices WHERE source_id=$1 AND slug=$2', [src, slug]);
+  await keyed('page_aliases', 'SELECT 1 FROM page_aliases WHERE source_id=$1 AND slug=$2', [src, slug]);
+  await keyed('slug_aliases', 'SELECT 1 FROM slug_aliases WHERE source_id=$1 AND canonical_slug=$2', [src, slug]);
   await keyed('files', 'SELECT 1 FROM files WHERE page_slug=$2 AND (source_id=$1 OR source_id IS NULL)', [src, slug]);
   await keyed('write_gate_holds', 'SELECT 1 FROM write_gate_holds WHERE source_id=$1 AND slug=$2', [src, slug]);
   await keyed('query_cache', 'SELECT 1 FROM query_cache WHERE $1::text IS NOT NULL', [src]);
@@ -361,7 +387,7 @@ export async function verifyPagePurge(engine: BrainEngine, input: { sourceId: st
       if (at >= 0 && stores[at]!.status !== 'incomplete') stores[at] = report; else if (at < 0) stores.push(report);
     }
     stores.push(all.size ? { store: 'source_prose', status: 'out_of_scope', reason: 'source_prose', remaining: all.size, items: [...all].sort(),
-      detail: 'Other pages still state a claim from the purged page in their prose; edit or purge them.' } : { store: 'source_prose', status: 'not_present' });
+      detail: 'Other pages still state a claim from the purged page in their prose; edit or purge them.' } : await unprobedSegmentedPages(engine, src, { store: 'source_prose', status: 'not_present' }));
   }
   const [source] = await engine.executeRaw<{ local_path: string | null }>('SELECT local_path FROM sources WHERE id=$1', [src]);
   const files = source?.local_path ? (context?.paths ?? []).filter(p => !p.startsWith('/') && !p.includes('..')).map(p => join(source.local_path!, p)) : [];

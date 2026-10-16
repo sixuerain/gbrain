@@ -6,6 +6,7 @@ import type { BrainEngine } from '../engine.ts';
 import type { GBrainConfig } from '../config.ts';
 import { serializePageToMarkdown } from '../markdown.ts';
 import { opError, OperationError } from '../ops/contract.ts';
+import { assertInlineBody } from '../page-body/page-shape.ts';
 import { pageIdentityError } from './page-identity.ts';
 import { renderTimelineEntry, spliceTimelineBlock } from '../timeline-write-through.ts';
 import { extractTimelineFromContent } from '../timeline-extract.ts';
@@ -45,6 +46,7 @@ export function regeneratedByWriter(sourceKind: string | null | undefined, page:
 export async function prepareSemanticPageMutation(engine: BrainEngine, row: WriteRequest, config: GBrainConfig): Promise<PreparedMutation> {
   const snapshot = await engine.readPageSnapshot(row.slug, { sourceId: row.source_id });
   if (!snapshot || snapshot.page.id !== row.page_id) throw pageIdentityError(snapshot != null, 'The accepted page was replaced by another page.');
+  assertInlineBody(snapshot.page, row.operation);
   const p = row.intent!;
   if (p.expected_revision !== undefined) assertPageRevision(snapshot,engineMutationPrecondition(parseMutationPrecondition(p)));
   if (row.operation === 'add_tag' || row.operation === 'remove_tag') {
@@ -56,7 +58,9 @@ export async function prepareSemanticPageMutation(engine: BrainEngine, row: Writ
     const prepared = await preparePageMutation(engine, row, config, {
       expectedRevision: snapshot.revision, tags, content: serializePageToMarkdown(snapshot.page, tags),
     });
-    return { ...prepared, apply: async tx => ({ ...await prepared.apply(tx), status: 'ok', tag }) };
+    // #5251: a tag change leaves every chunk's text as it was, so the republication queues no
+    // embedding effect; the stale sweep still picks up any chunk the publish left without a vector.
+    return { ...prepared, deferEmbedding: true, apply: async tx => ({ ...await prepared.apply(tx), status: 'ok', tag }) };
   }
   if (row.operation !== 'add_timeline_entry') {
     throw opError('writer_coordinator_required', 'This semantic writer has no registered preparation handler.',
@@ -91,6 +95,7 @@ export async function prepareSemanticPageMutation(engine: BrainEngine, row: Writ
     const [stored] = gate.verdict === 'flag' ? await tx.executeRaw<{ id: number }>(`SELECT t.id FROM timeline_entries t JOIN pages p ON p.id = t.page_id
       WHERE p.source_id = $1 AND p.slug = $2 AND t.date = $3::date AND t.summary = $4 ORDER BY t.id DESC LIMIT 1`, [row.source_id, row.slug, rendered.canonical.date, rendered.canonical.summary]) : [];
     const flagged = stored ? gateField(gate, `p:${row.source_id}/${row.slug}`, await recordWriteGateReceipt(tx, { targetTable: 'timeline_entries', targetId: Number(stored.id), sourceId: row.source_id, assessment: gate, requestId: row.id })) : undefined;
-    return { ...outcome, status: exact && !inserted ? 'skipped' : 'ok', ...(exact && !inserted ? { reason: 'duplicate' } : {}), entry: rendered.canonical, ...(flagged ? { gate: flagged } : {}) };
+    // #5970: the rendered bullet is the exact line to edit (edit_page) when the entry needs a correction.
+    return { ...outcome, status: exact && !inserted ? 'skipped' : 'ok', ...(exact && !inserted ? { reason: 'duplicate' } : {}), entry: rendered.canonical, bullet: rendered.block, ...(flagged ? { gate: flagged } : {}) };
   } };
 }

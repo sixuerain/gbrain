@@ -22,6 +22,8 @@ import { isValidSourceId } from './source-id.ts';
 import { isDatedTimelineLine, parseInlineCitationTimelineEntries, TIMELINE_LINE_RE, TIMELINE_LINE_RE_CN } from './timeline-citations.ts';
 import { isMaterializedMarkerLine } from './timeline-marker.ts';
 import { slugifyPath, slugifySegment } from './sync.ts';
+import { exactSlugCandidates } from './exact-slug-candidates.ts';
+export { EXACT_SLUG_SHAPE_RE, exactSlugCandidates } from './exact-slug-candidates.ts';
 import { SLUG_WORD_CHARS, SLUG_VARIATION_SELECTORS_RE } from './cjk.ts';
 import { foldNonDecomposingLatin } from './latin-fold.ts';
 import { isIdentityEntity, sameEntityName } from './entities/resolve.ts';
@@ -583,6 +585,38 @@ function resolveRelativeSlug(pageSlug: string, ref: EntityRef): string {
   return [...dirSegs.slice(0, keep), ref.slug].join('/');
 }
 
+/**
+ * A same-directory markdown ref (`sameDir`) resolved against the linking
+ * page's directory: `../` / `./../` prefixes (upLevels) and any mid-path
+ * `.`/`..` fold the way the FS walker's join() does, slugified through the
+ * sync grammar. A run that would climb above the root is a dangling link
+ * there too, so it resolves to '' (no candidate).
+ */
+function resolveSameDirSlug(pageSlug: string, ref: EntityRef): string {
+  const segs = pageSlug.includes('/') ? pageSlug.split('/').slice(0, -1) : [];
+  for (const seg of ('../'.repeat(ref.upLevels ?? 0) + ref.slug).split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg !== '..') { segs.push(seg); continue; }
+    if (segs.length === 0) return '';
+    segs.pop();
+  }
+  return slugifyPath(segs.join('/'));
+}
+
+/**
+ * The page slug a markdown link `href` on page `pageSlug` points at, resolved
+ * exactly as extractPageLinks resolves it (page-relative `./` and `../`,
+ * root-relative dir paths, `.md` and `#anchor` stripped). Null when the
+ * extractor would emit no link for it. The writer's link validator calls
+ * this, so "the validator accepts it" means "the graph links it".
+ */
+export function resolveMarkdownLinkSlug(pageSlug: string, href: string): string | null {
+  const ref = extractEntityRefs(`[link](${href})`)[0];
+  if (!ref) return null;
+  const target = ref.sameDir ? resolveSameDirSlug(pageSlug, ref) : resolveRelativeSlug(pageSlug, ref).toLowerCase();
+  return target || null;
+}
+
 // ─── Link candidates (richer than EntityRef) ────────────────────
 
 export interface LinkCandidate {
@@ -782,18 +816,7 @@ export async function extractPageLinks(
     // `[Alice](Alice%20Chen.md)` reaches `people/alice-chen`. Downstream
     // existence checks drop targets that aren't pages.
     if (ref.sameDir) {
-      const segs = slug.includes('/') ? slug.split('/').slice(0, -1) : [];
-      // `../` / `./../` prefixes (upLevels) and any mid-path `.`/`..` fold
-      // the way the FS walker's join() does; a run that would climb above
-      // the root is a dangling link there too, so it yields no candidate.
-      let climbed = false;
-      for (const seg of ('../'.repeat(ref.upLevels ?? 0) + ref.slug).split('/')) {
-        if (seg === '' || seg === '.') continue;
-        if (seg !== '..') { segs.push(seg); continue; }
-        if (segs.length === 0) { climbed = true; break; }
-        segs.pop();
-      }
-      const target = climbed ? '' : slugifyPath(segs.join('/'));
+      const target = resolveSameDirSlug(slug, ref);
       if (target && target !== slug) {
         const idx = ref.index ?? content.indexOf(ref.name);
         const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
@@ -1023,7 +1046,7 @@ export function resolvedLinkCandidate(candidate: LinkCandidate, originSlug: stri
     from_source_id: resolved.fromSourceId, to_source_id: resolved.toSourceId,
     link_type: candidate.linkType, context: candidate.context, link_source: candidate.linkSource,
     origin_slug: candidate.canonicalAttendance ? originSlug : candidate.originSlug,
-    origin_source_id: originSourceId, origin_field: candidate.originField,
+    origin_source_id: originSourceId, origin_field: candidate.originField, resolution_type: candidate.targetSourceId ? 'qualified' as const : 'unqualified' as const,
   };
   return candidate.canonicalAttendance ? orientCanonicalAttendance(row) : row;
 }
@@ -1753,29 +1776,23 @@ export function makeResolver(
 
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
-      // Step 1: already a slug? Try an exact page lookup for any slug-shaped
-      // value (contains '/', slug charset). Broadened beyond the original
-      // single-segment lowercase-leading form (`^[a-z][a-z0-9-]*\/[a-z0-9]...`)
-      // to also accept digit-leading folders (`90-people/nicolai`,
-      // `01-trading/...`) and nested paths (`a/b/c`) — common in PARA-numbered
-      // vaults. This is an EXACT getPage match only — no fuzzy — so it never
-      // produces a false positive; a non-existent slug just falls through to
-      // the steps below. Fixes frontmatter `related: [[dir/slug]]` values
-      // (unwrapped by unwrapWikilink) that name a real page the strict regex
-      // could not reach and whose full-path fuzzy score is below threshold.
-      if (/\//.test(trimmed) && /^[a-z0-9][a-z0-9/_-]*$/.test(trimmed)) {
+      // Step 1: a path-shaped value names its page exactly. Try each exact
+      // candidate (the value itself when slug-shaped, then the slug sync
+      // mints for that path), then a rename alias. Exact lookups only, so a
+      // miss falls through to the steps below and never invents an edge.
+      for (const candidate of exactSlugCandidates(trimmed)) {
         // Same source scope as the basename index above (#972): a wikilink in
         // source A must not resolve to a same-slug page in source B.
-        const page = await engine.getPage(trimmed, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
+        const page = await engine.getPage(candidate, opts.sourceId ? { sourceId: opts.sourceId } : undefined); // gbrain-allow-unscoped-getpage: read-only wikilink resolution; unscoped-when-no-source is the documented single-source behavior
         if (page) {
-          cache.set(cacheKey, trimmed);
-          return trimmed;
+          cache.set(cacheKey, candidate);
+          return candidate;
         }
         // A renamed page leaves `old -> new` in slug_aliases; links written
         // against the old slug keep resolving to the page that moved.
         if (typeof engine.resolveSlugWithAlias === 'function') {
-          const canonical = await engine.resolveSlugWithAlias(trimmed, opts.sourceId ?? 'default');
-          if (canonical !== trimmed && await engine.getPage(canonical, { sourceId: opts.sourceId ?? 'default' })) {
+          const canonical = await engine.resolveSlugWithAlias(candidate, opts.sourceId ?? 'default');
+          if (canonical !== candidate && await engine.getPage(canonical, { sourceId: opts.sourceId ?? 'default' })) {
             cache.set(cacheKey, canonical);
             return canonical;
           }
@@ -2099,7 +2116,7 @@ export function findTimelineSourceDelimiter(text: string): number {
 // pass skips the lines they read.
 
 // `### YYYY-MM-DD — summary` headings, as the FS extractor (timeline-extract.ts Format 2) accepts.
-const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
+export const TIMELINE_HEADING_RE = /^\s*###\s+(\d{4}-\d{2}-\d{2})\s*[\-–—]+\s*(.+?)\s*$/;
 
 /**
  * Parse timeline entries from content. Looks at:

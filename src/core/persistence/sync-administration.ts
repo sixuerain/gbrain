@@ -5,7 +5,7 @@ import { currentVerifiedLocalWriter } from './identity.ts';
 import { submissionAuthority } from './authority.ts';
 import type { OperationContext } from '../ops/contract.ts';
 import { validateSyncWireParams } from './sync-wire.ts';
-import { explicitSyncProcessing } from './sync-authority.ts';
+import { readManagedMode } from './managed-mode.ts';
 import { trustedCliRequired } from '../ops/op-fix.ts';
 
 /** Private CLI transport: wire fields can never manufacture a trust lane. */
@@ -26,8 +26,7 @@ export async function runAuthenticatedSyncSlice(engine: BrainEngine, params: Rec
   const unregister=engine.registerBeforeDisconnect(async()=>{controller.abort();await work?.catch(()=>{});});
   try {
     work=(async()=>{
-      const [brain]=await engine.executeRaw<{enabled:boolean}>('SELECT enabled FROM persistence_brain WHERE singleton=1');
-      if(!brain?.enabled) {
+      if(!await readManagedMode(engine)) {
         const {performSync}=await import('../../commands/sync.ts');
         // Delegation bypasses runSync's inline embedding cost/config gate.
         // Preserve import-only publication; the owner drains accepted embeds.
@@ -39,7 +38,7 @@ export async function runAuthenticatedSyncSlice(engine: BrainEngine, params: Rec
         return {...result,source_id:sourceId};
       }
       const {performManagedSync}=await import('./sync-run.ts');
-      return {...await performManagedSync(engine,{...wire.options,sourceId,explicitProcessing:explicitSyncProcessing(wire.options as Record<string,unknown>),signal:controller.signal},{maxPages:25,maxMs:1000}),source_id:sourceId};
+      return {...await performManagedSync(engine,{...wire.options,sourceId,signal:controller.signal},{maxPages:25,maxMs:1000}),source_id:sourceId};
     })();
     return await work;
   } finally {if(timer)clearTimeout(timer);unregister();}

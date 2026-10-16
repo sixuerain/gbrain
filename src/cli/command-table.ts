@@ -178,6 +178,10 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // selfHelp: `gbrain connect --help` prints its own usage (flags + examples) from runConnect; route
   // around the generic one-line short-circuit.
   { name: 'connect', phase: 'pre-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/connect.ts') },
+  // D8: `gbrain setup <harness>` orchestrates init + harness wiring. Engine-free (a new brain is
+  // created by the `gbrain init` child it runs); thinClient 'none' because it resolves a hosted
+  // target itself and refuses with setup_hosted_connection instead of creating a local brain.
+  { name: 'setup', phase: 'pre-connect', thinClient: 'none', selfHelp: true, json: 'document', load: () => import('./commands/setup.ts') },
   // CLI_ONLY: Agent-bootstrap family (ENG-2 three-touchpoint rule): `bootstrap` + `hook` are
   // ENGINE-FREE (dispatched in handleCliOnly before the connectEngine terminator) and must NEVER
   // enter THIN_CLIENT_REFUSED_COMMANDS. `sweep` is the trusted local sweep entry [CX2-5] and needs
@@ -190,6 +194,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // update cache would spawn a detached network-touching check-update child per prompt and emit
   // UPGRADE_AVAILABLE stderr per turn. NOTE: this path no-ops under NODE_ENV=test, so membership is
   // pinned by a source grep (test/hook-command.serial.test.ts), not a runtime test.
+  // CLI_ONLY (#6530): shared-checkout-safe commit/push/pull; DB-free, pushes with host git credentials, never MCP.
+  { name: 'git', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/git.ts') },
   { name: 'hook', phase: 'pre-connect', thinClient: 'none', selfHelp: true, skipStartupHooks: true, load: () => import('./commands/hook.ts') },
   // CLI_ONLY: Monthly backup-coverage check (engine via thunk — pre-engine branch, lock-safe).
   // selfHelp: backup ships its own HELP (runBackupCli guard, engine-free — the command dispatches in
@@ -353,7 +359,7 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   { name: 'onboard', phase: 'post-connect', thinClient: 'none', help: () => import('./help/onboard.ts'), load: () => import('./commands/onboard.ts') },
   { name: 'founder', phase: 'post-connect', thinClient: 'none', selfHelp: true, load: () => import('./commands/founder.ts') },
   { name: 'think', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/think.ts') },
-  { name: 'recall', phase: 'post-connect', thinClient: 'none', routes_source: true, load: () => import('./commands/recall.ts') },
+  { name: 'recall', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/recall.ts') },
   // CLI_ONLY: v0.42.58 (#2035 class, caught by the handleCliOnly reachability sweep): full handler
   // at `case 'notability-eval'` but never dispatchable.
   { name: 'notability-eval', phase: 'post-connect', thinClient: 'none', load: () => import('./commands/notability-eval.ts') },
@@ -367,6 +373,8 @@ export const CLI_COMMANDS: readonly CliCommandRecord[] = [  // Pre-connect: disp
   // CLI_ONLY: Open-loop engine CLI (engine-bound; trusted-local op dispatch).
   { name: 'waiting', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/waiting.ts') },
   { name: 'loops', phase: 'post-connect', thinClient: 'none', selfHelp: true, routes_source: true, load: () => import('./commands/loops.ts') },
+  // CLI_ONLY: pinned questions (C4); trusted-local op dispatch of the questions_* ops.
+  { name: 'questions', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, routes_source: true, load: () => import('./commands/questions.ts') },
   // CLI_ONLY: relationship-contradiction proposals (temporal typed edges); host-local, writes canonical timeline lines.
   { name: 'edge-proposals', phase: 'post-connect', thinClient: 'refuse', selfHelp: true, load: () => import('./commands/edge-proposals.ts') },
   // selfHelp: core prints its own usage (commands/core.ts). Always-loaded core memory, docs/guides/core-memory.md.
