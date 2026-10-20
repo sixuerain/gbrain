@@ -38,6 +38,7 @@ import { assertRestoreOrigin } from './detached-pages.ts';
 import { colonSlugWindowsRefusal, isWindowsColonTarget } from './native-file-target.ts';
 import { publishesDatabaseOnly } from './page-prepare.ts';
 import { materializedSnapshot } from './segmented-apply.ts';
+import { liveSearchable } from './searchable.ts';
 import { cachedPreadmitBrain, dropPreadmitCache, preadmitReads, preadmitRecheckFailed } from './preadmit-cache.ts';
 import { pipelined } from '../page-state/transactions.ts';
 import { isMirrorOnlyPage, sourceMirrorReadOnly } from './mirror-read-only.ts';
@@ -72,7 +73,7 @@ const BATCH_SHARED_READS = new Set([
   'SELECT brain_id FROM persistence_brain WHERE singleton=1',
   'SELECT value FROM config WHERE key=$1',
   "SELECT config,incarnation FROM sources WHERE id=$1",
-  "SELECT id FROM source_ingestion_receipts WHERE source_id=$1 AND source_incarnation=$2::uuid AND profile='company-brain' LIMIT 1",
+  "SELECT r.id FROM source_ingestion_receipts r JOIN sources s ON s.id=r.source_id AND s.incarnation=r.source_incarnation WHERE r.source_id=$1 AND r.profile='company-brain' LIMIT 1",
   'SELECT s.id,s.local_path,h.local_path AS worktree_path,b.relative_path FROM sources s LEFT JOIN persistence_source_bindings b ON b.source_id=s.id AND b.source_incarnation=s.incarnation LEFT JOIN persistence_host_bindings h ON h.worktree_id=b.worktree_id AND h.host_id=$1::uuid WHERE NOT s.archived',
 ]);
 /**
@@ -182,6 +183,21 @@ export function pendingAwareResponse(ctx: OperationContext, row: WriteRequest): 
   }
 }
 
+/**
+ * A committed reply whose outcome left the projection pending says whether search sees the page now (searchable.ts), in
+ * the reply and its `write_request`; `projection: 'pending'` stays only while it still is.
+ */
+async function withLiveSearchable(ctx: OperationContext, response: Record<string, unknown>): Promise<Record<string, unknown>> {
+  if (response.searchable !== 'pending') return response;
+  const live = await liveSearchable(ctx, response as Parameters<typeof liveSearchable>[1]);
+  const settle = (fields: Record<string, unknown>) => {
+    const { projection, ...rest } = fields;
+    return { ...(live.searchable === 'pending' ? { projection } : {}), ...rest, ...live };
+  };
+  const receipt = response.write_request as Record<string, unknown> | undefined;
+  return { ...settle(response), ...(receipt ? { write_request: settle(receipt) } : {}) };
+}
+
 /** #6188 (D21): a write whose fence Tier 1 rewrote carries one `fence_normalized` coaching notice. */
 export function emitFenceNotice(ctx: Pick<OperationContext, 'emitNotice'>, response: Record<string, unknown>, slug?: string): void {
   const report = response.fences_normalized as FencesNormalized | undefined;
@@ -198,7 +214,7 @@ const OWNER_FILE_INTENTS: ReadonlySet<string> = new Set(['managed_file_import', 
 export interface PageBatchMember { id: string; index: number; size: number; requestId: string; repeats?: number[] }
 
 export async function submitPageMutation(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection }): Promise<Record<string, unknown>> {
+  input: { operation: string; params: Record<string, unknown>; waitMs?: number; managedFileImport?: true; timelineSection?: TimelineSection; databaseOnly?: 'overwrite_restore' }): Promise<Record<string, unknown>> {
   assertPersistenceAccepting(ctx.engine);
   // #6007: wait_ms is a reply deadline from arrival, never part of the write's identity.
   const arrived = performance.now();
@@ -209,7 +225,7 @@ export async function submitPageMutation(ctx: OperationContext,
   // cache could explain drops it and prepares the write once more, uncached, so it ends as it would without it.
   const cached = await preadmitReads(ctx.engine);
   let prepared = await preparePageAdmission(cached ? { ...ctx, engine: cached } : ctx, { ...input, params });
-  if (prepared.prior) return throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false);
+  if (prepared.prior) return withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false));
   const brainId = cached ? cachedPreadmitBrain(ctx.engine) : undefined;
   // Phase 4.4: the admission transaction runs on the warm single-write lane when it is free.
   const admit = (admission: WriteAdmission) => onPersistenceLane(ctx.engine, transaction => admitWrite(ctx.engine, admission, undefined, transaction),
@@ -220,10 +236,10 @@ export async function submitPageMutation(ctx: OperationContext,
     if (!cached || !preadmitRecheckFailed(error)) throw error;
     dropPreadmitCache(ctx.engine);
     prepared = await preparePageAdmission(ctx, { ...input, params: { ...params, request_id: prepared.admission.requestId } });
-    if (prepared.prior) return throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false);
+    if (prepared.prior) return withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, prepared.prior, ctx.config, waitMs())), false));
     row = await admit(prepared.admission);
   }
-  const response = throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, row, ctx.config, waitMs())), false);
+  const response = await withLiveSearchable(ctx, throwIfHeld(pendingAwareResponse(ctx, await waitForWrite(ctx.engine, row, ctx.config, waitMs())), false));
   emitFenceNotice(ctx, response, row.slug);
   return { ...response, ...(prepared.typeWarning ? { type_warning: prepared.typeWarning } : {}), ...(prepared.slugAdvisory ? { slug_advisory: prepared.slugAdvisory } : {}) };
 }
@@ -234,7 +250,9 @@ export async function submitPageMutation(ctx: OperationContext,
  * the admission to submit. `put_pages` admits several of these together.
  */
 export async function preparePageAdmission(ctx: OperationContext,
-  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection }
+  input: { operation: string; params: Record<string, unknown>; managedFileImport?: true; batch?: PageBatchMember; timelineSection?: TimelineSection;
+    /** #6712 `repair overwritten-edits`: publish to the database only, so the restore never rewrites the committed file. */
+    databaseOnly?: 'overwrite_restore' }
 ): Promise<{ prior: WriteRequest; admission?: undefined; typeWarning?: undefined; slugAdvisory?: undefined } | { prior?: undefined; admission: WriteAdmission; typeWarning: PageTypeWarning | null; slugAdvisory: string | null }> {
   if (input.operation === 'put_page' && ['kind', 'preview', 'backup_reference'].some(key => Object.hasOwn(input.params, key))) {
     if (ctx.remote !== false || input.managedFileImport !== true || !OWNER_FILE_INTENTS.has(String(input.params.kind)) ||
@@ -355,9 +373,10 @@ export async function preparePageAdmission(ctx: OperationContext,
   let binding = boundAtStart;
   const sandbox = ctx.viaSubagent === true && !(ctx.allowedSlugPrefixes?.length);
   const configuredWriteThrough = !/^(false|0|off|no)$/i.test(writeThroughSetting ?? 'true');
-  const writeThrough = configuredWriteThrough && !sandbox;
+  const writeThrough = configuredWriteThrough && !sandbox && !input.databaseOnly;
   const root = source.local_path || repoPath;
   if (sandbox) authority.databaseOnlyReason = 'subagent_sandbox';
+  else if (input.databaseOnly) authority.databaseOnlyReason = input.databaseOnly;
   else if (!configuredWriteThrough) authority.databaseOnlyReason = 'disabled_by_config';
   else if (!root && !binding) authority.databaseOnlyReason = 'no_repo_configured';
   if (p.local_dir !== undefined) {

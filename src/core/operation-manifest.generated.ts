@@ -130,6 +130,16 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
           "type": "string"
         },
         "description": "Or up to 50 names/codes at once: compact rows."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Read only this source. Default: your source first, then every source you can read.",
+        "fullSurfaceOnly": true
+      },
+      "prefer_source_id": {
+        "type": "string",
+        "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -270,7 +280,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "bytes": {
         "type": "object",
-        "description": "Window: UTF-8 bytes (snapped to a line start).",
+        "description": "Window: UTF-8 bytes of size.total_bytes, not body_bytes (snapped to a line start).",
         "properties": {
           "offset": {
             "type": "number",
@@ -350,6 +360,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "Lowest trust tier to return (the connection floor still applies).",
         "fullSurfaceOnly": true
+      },
+      "known_as_of": {
+        "type": "string",
+        "fullSurfaceOnly": true,
+        "description": "Recorded time: the page as this brain had recorded it at this ISO 8601 instant (2026-10-01T12:00:00Z), from the belief ledger. Not as_of, which is valid time (a date)."
       }
     },
     "scope": "read",
@@ -1153,7 +1168,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "expand": {
         "type": "boolean",
-        "description": "Default per search mode (tokenmax on)."
+        "description": "Default off; search.expansion overrides."
       },
       "detail": {
         "type": "string",
@@ -1669,7 +1684,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "List a page's outgoing links (typed edges to other pages). Use when exploring what a page points at; rows carry status and dates, live relationships by default (status: \"all\" for history, during: \"2022\" for a period). Pass source_id or all_sources to widen. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
+    "description": "List a page's outgoing links (typed edges to other pages). Use when exploring what a page points at; rows carry status and dates, live relationships by default (status: \"all\" for history, during: \"2022\" for a period). Pass source_id or all_sources to widen. Returns up to 500 rows per call (limit, max 5000); a cut list's last row carries truncated: true and next_cursor, which you pass as cursor. Needs read scope. On page_not_found: resolve the slug with resolve_slugs.",
     "params": {
       "slug": {
         "type": "string",
@@ -1704,6 +1719,19 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "all_sources": {
         "type": "boolean",
         "description": "Same as source_id __all__."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Rows per call (default 500, max 5000)."
+      },
+      "cursor": {
+        "type": "string",
+        "description": "next_cursor from the previous call (same filters)."
+      },
+      "all": {
+        "type": "boolean",
+        "description": "Local CLI only: every row, paging internally.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -1723,7 +1751,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "Links to a page; group:\"page\" pages by referrer, newest first.",
+    "description": "Links to a page, ≤500/call; group:\"page\" by referrer, newest first.",
     "params": {
       "slug": {
         "type": "string",
@@ -1763,11 +1791,16 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       },
       "limit": {
         "type": "number",
-        "description": "Max 500."
+        "description": "≤5000"
       },
       "cursor": {
         "type": "string",
-        "description": "Paging."
+        "description": "Next."
+      },
+      "all": {
+        "type": "boolean",
+        "description": "Local CLI only: every row, paging internally.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -2080,6 +2113,21 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "include_body": {
         "type": "boolean",
         "description": "true adds compiled_truth and timeline to every version. Default false (metadata only)."
+      },
+      "known_as_of": {
+        "type": "string",
+        "fullSurfaceOnly": true,
+        "description": "Recorded time: the validity intervals this brain had recorded by this ISO 8601 instant, from the belief ledger. Not as_of, which is valid time (a date)."
+      },
+      "diff": {
+        "type": "boolean",
+        "fullSurfaceOnly": true,
+        "description": "With known_as_of: each version also carries a unified diff from the version before it."
+      },
+      "source_id": {
+        "type": "string",
+        "description": "With known_as_of: the source.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -3684,6 +3732,18 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
       "until": {
         "type": "string",
         "description": "Window end (YYYY-MM-DD)"
+      },
+      "group_by": {
+        "type": "string",
+        "enum": [
+          "holder",
+          "source"
+        ],
+        "description": "Trusted local CLI only: per-group journal statistics"
+      },
+      "min_n": {
+        "type": "number",
+        "description": "Trusted local CLI only: groups with fewer resolved predictions are flagged low_n (default 10)"
       }
     },
     "cliHints": {
@@ -5177,6 +5237,32 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "With counterparty: the task the brief is for.",
         "fullSurfaceOnly": true
+      },
+      "source_id": {
+        "type": "string",
+        "description": "Resolve entities in this source only. Default: your source first, then every source you can read.",
+        "fullSurfaceOnly": true
+      },
+      "entity_refs": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "source_id": {
+              "type": "string"
+            },
+            "slug": {
+              "type": "string"
+            }
+          }
+        },
+        "description": "Source-qualified entities: [{\"source_id\":\"wiki\",\"slug\":\"people/alice-example\"}].",
+        "fullSurfaceOnly": true
+      },
+      "prefer_source_id": {
+        "type": "string",
+        "description": "Source to try first (thin clients send .gbrain-source here); never narrows.",
+        "fullSurfaceOnly": true
       }
     },
     "scope": "read",
@@ -5243,6 +5329,11 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
         ],
         "description": "Lowest trust tier to return (the connection floor still applies).",
         "fullSurfaceOnly": true
+      },
+      "beliefs": {
+        "type": "boolean",
+        "fullSurfaceOnly": true,
+        "description": "Add `beliefs`: each belief that changed in the window, before and after, with cause and evidence (belief ledger); entities narrows it."
       }
     },
     "scope": "read",
@@ -5533,7 +5624,7 @@ export const OPERATION_MANIFEST: OperationMeta[] = [
     "mutating": false,
     "idempotent": true,
     "outputRedaction": "retrieval",
-    "description": "BEFORE editing any function, run code_callers with the symbol name to find every caller (the people who'd be affected by your change). Returns direct callers from the tree-sitter call graph. Use during plan-mode to size the change. Defaults to source-scoped; for multi-source brains pass source_id or all_sources=true. Returns: `{symbol, count, callers: [{from_symbol_qualified, to_symbol_qualified, edge_type, resolved}]}`. Example: `{symbol:'parseMarkdown', count:4, callers:[{from_symbol_qualified:'callerInA', to_symbol_qualified:'parseMarkdown', edge_type:'calls', resolved:true}]}`. Temporarily available only to trusted local CLI callers; agent-facing code reads are suspended.",
+    "description": "BEFORE editing any function, run code_callers with the symbol name to find every caller (the people who'd be affected by your change). Returns direct callers from the tree-sitter call graph. Use during plan-mode to size the change. Defaults to source-scoped; for multi-source brains pass source_id or all_sources=true. `resolved:false` marks a call matched by name only: the resolver links calls within one file, so a cross-file call stays unresolved and may name a different symbol with the same name. Returns: `{symbol, count, callers: [{from_symbol_qualified, to_symbol_qualified, edge_type, resolved}]}`. Example: `{symbol:'parseMarkdown', count:4, callers:[{from_symbol_qualified:'callerInA', to_symbol_qualified:'parseMarkdown', edge_type:'calls', resolved:true}]}`. Temporarily available only to trusted local CLI callers; agent-facing code reads are suspended.",
     "params": {
       "symbol": {
         "type": "string",

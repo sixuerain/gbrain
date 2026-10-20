@@ -1,4 +1,5 @@
 import { searchAnswerFeedback } from '../feedback/record.ts';
+import { readSourceFreshness } from '../notifier/status.ts';
 import { recordRecallOutcome } from '../funnel.ts';
 import type { RelationalPlanMeta } from '../search/relational-recall.ts';
 import type { Notice } from '../agent-output.ts';
@@ -39,8 +40,9 @@ import { TargetTrace, diagnoseProbe, diagnoseTrace, probeTarget, type ExplainTar
 import { assembleEvidenceForHits, capDeliveredSnippets, capEvidenceToBudget, deliverEvidence, pagePlanHits, resolveEvidencePlan, selectLongPages, unsupportedDelivery, withLongPagePolicy, type DeliveryMeta, type DeliveryScope, type EvidencePlan, type FrozenHit, type ReturnUnit } from '../search/evidence-delivery.ts';
 import { privateProvenanceFilterFragment, resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { AUDIT_ROW_SOURCES } from '../facts/audit-sources.ts';
-import { SAFE_FENCE_CHUNKER_VERSION } from '../search/safe-chunks.ts';
+import { SAFE_FENCE_CHUNKER_VERSION, chunkManifestReads } from '../search/safe-chunks.ts';
 import { expandEngineTypeFilters } from '../schema-pack/query-types.ts';
+import { reconcileTypeFilter } from './search-type-filter.ts';
 import { probeProjectionReadiness } from '../search/projection-readiness.ts';
 import { resolveBoostMap, resolveHardExcludes } from '../search/source-boost.ts';
 import { pageReadFilter } from '../search/read-policy-sql.ts';
@@ -253,40 +255,6 @@ async function hasUnsealedPagesInScope(ctx: OperationContext, scope: SourceScope
   }
 }
 
-/**
- * Agents guess page types ("company", "account", "deal") that a brain may not
- * have, and a filter on a type with no pages silently hides every page
- * (gbrain-evals Cat 40: type-filtered agent runs failed 62% of tasks against
- * 51% unfiltered). Requested types with no readable pages in scope are
- * dropped, the rest stay; when none remain the filter is lifted. Either way
- * the caller is told which types exist so it can refine.
- */
-async function reconcileTypeFilter(ctx: OperationContext, scope: SourceScope, excludePrivate: boolean,
-  types: string[] | undefined): Promise<{ types: string[] | undefined; notice?: string }> {
-  if (!types || scope.sourceIds?.length === 0) return { types };
-  const params: unknown[] = [];
-  let present: Set<string>;
-  try {
-    const rows = await ctx.engine.executeRaw<{ type: string }>(
-      `SELECT DISTINCT p.type FROM pages p WHERE ${pageReadFilter('p', { ...scope, excludePrivate }, params, true)} LIMIT 500`, params);
-    present = new Set(rows.map(r => r.type));
-  } catch {
-    return { types };
-  }
-  const keep: string[] = [];
-  const missing: string[] = [];
-  for (const type of types) {
-    // A schema-pack lookup failure propagates: typed reads fail closed rather than fall back to literal types.
-    const expanded = (await expandEngineTypeFilters(ctx.engine, { types: [type], ...scope })).types ?? [type];
-    (expanded.length === 0 || expanded.some(t => present.has(t)) ? keep : missing).push(type);
-  }
-  if (missing.length === 0) return { types };
-  const available = [...present].sort().join(', ');
-  return keep.length === 0
-    ? { types: undefined, notice: `No pages have type ${missing.join(', ')}, so the type filter was dropped and every page type was searched. Page types in this brain: ${available}.` }
-    : { types: keep, notice: `No pages have type ${missing.join(', ')}; filtered to ${keep.join(', ')}. Page types in this brain: ${available}.` };
-}
-
 const FACT_MATCH_STOPWORDS = new Set(['the', 'and', 'for', 'who', 'what', 'when', 'where', 'which', 'with', 'from', 'that', 'this', 'are', 'was', 'were', 'our', 'your', 'their', 'now', 'current', 'currently', 'should', 'does', 'did', 'has', 'have', 'how', 'any', 'all', 'about', 'into', 'its', 'next']);
 
 export interface AliasDeclaration { name: string; alias: string; slug: string }
@@ -461,27 +429,31 @@ async function buildRetrievalResponseMeta(
     : undefined;
   const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
   const excludeSlugPrefixes = resolveHardExcludes();
-  const safeIndexPending = ctx.remote !== false
-    && await hasUnsealedPagesInScope(ctx, scope, excludePrivate, { types: opts.types, excludeSlugPrefixes });
-  const readiness = await probeProjectionReadiness(ctx.engine, {
-    ...scope,
-    excludePrivate,
-    types: opts.types,
-    excludeSlugPrefixes,
-  });
   const aliases = (opts.declarations ?? new DeclarationMemo()).scan(results as DeclarationRow[], queryText);
-  // Facts saved about the entity the query names come first (newest first, one hop through entities they name).
-  const entityFacts = opts.entity && ctx.emitResponseMeta ? await entitySavedFacts(ctx.engine, opts.entity, { remote: ctx.remote !== false, excludePrivate }) : [];
+  // #6721: these reads depend on nothing but the inputs above, so they run at once: on a pooled Postgres
+  // the wall time is the slowest read's round trips, not their sum. The answer-feedback write still runs last.
+  const [safeIndexPending, readiness, entityFacts, matchedFacts, heldFiles, sourceFreshness] = await Promise.all([
+    ctx.remote !== false && hasUnsealedPagesInScope(ctx, scope, excludePrivate, { types: opts.types, excludeSlugPrefixes }),
+    probeProjectionReadiness(ctx.engine, { ...scope, excludePrivate, types: opts.types, excludeSlugPrefixes }),
+    // Facts saved about the entity the query names come first (newest first, one hop through entities they name).
+    opts.entity && ctx.emitResponseMeta ? entitySavedFacts(ctx.engine, opts.entity, { remote: ctx.remote !== false, excludePrivate }) : [],
+    matchingSavedFacts(ctx, scope, queryText, aliases),
+    stampHeldHits(ctx.engine, results as SearchResult[], scope, ctx).catch(() => []),
+    // GBRA-133 PR 2a.5: per-source freshness from the notifier's cached coverage record (no git call).
+    readSourceFreshness(ctx.engine, scope),
+  ]);
+  const heldBySource = new Map(heldFiles.map(h => [h.source_id, h.missing + h.stale]));
+  const freshness = sourceFreshness.map(f => ({ ...f, held_count: heldBySource.get(f.source_id) ?? 0 }));
   // A fact the facts arm already returned as a row is not repeated beside the blocks.
   const factRowIds = new Set((results as SearchResult[]).flatMap(r => r.fact_row ? [r.fact_row.id] : []));
-  const savedFacts = [...entityFacts, ...(await matchingSavedFacts(ctx, scope, queryText, aliases)).filter(m => !entityFacts.some(e => e.id === m.id))]
+  const savedFacts = [...entityFacts, ...matchedFacts.filter(m => !entityFacts.some(e => e.id === m.id))]
     .filter(f => !factRowIds.has(f.id));
-  const heldFiles = await stampHeldHits(ctx.engine, results as SearchResult[], scope, ctx).catch(() => []);
   const heldNotice = heldFilesNotice(heldFiles, ctx.remote !== false);
   if (heldNotice) ctx.emitNotice?.(heldNotice);
   const degraded = [...(m?.degraded ?? [])];
   if (safeIndexPending) degraded.push({ stage: 'safe_index_pending' });
-  if (readiness.status !== 'ready') {
+  if (readiness.status === 'by_design') degraded.push({ stage: 'projection_by_design' });
+  else if (readiness.status !== 'ready') {
     degraded.push({ stage: readiness.status === 'projection_pending' ? 'projection_pending' : 'projection_status_unknown' });
   }
   const planNotice = relationalPlanNotice(m?.relational_plan);
@@ -500,6 +472,7 @@ async function buildRetrievalResponseMeta(
       ...(m.answerability ? { answerability: m.answerability } : {}),
       ...(m.relational_plan ? { relational_plan: m.relational_plan } : {}),
       ...(m.rerank_gate ? { rerank_gate: m.rerank_gate } : {}),
+      ...(m.cosine_rescore ? { cosine_rescore: m.cosine_rescore } : {}),
     } : {}),
     ...((m?.degraded !== undefined || degraded.length > 0) ? { degraded } : {}),
     projection_readiness: readiness,
@@ -507,6 +480,7 @@ async function buildRetrievalResponseMeta(
     ...(savedFacts.length ? { saved_facts: savedFacts } : {}),
     ...(aliases.length ? { other_names: aliases } : {}),
     ...(heldFiles.length ? { held_files: heldFiles } : {}),
+    ...(freshness.length ? { freshness } : {}),
     ...(hint || readiness.hint ? { hint: [hint, readiness.hint].filter(Boolean).join(' ') } : {}),
     ...(opts.feedbackOp ? await searchAnswerFeedback(ctx, opts.feedbackOp, results as SearchResult[]) : {}),
   };
@@ -590,7 +564,7 @@ async function prepareExplainTarget(
   let probe;
   try {
     probe = await probeTarget((sql, params) => ctx.engine.executeRaw(sql, params), slug,
-      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false });
+      { ...scope, excludePrivate, requireSafeChunks: ctx.remote !== false }, await chunkManifestReads(ctx.engine));
   } catch {
     return { trace: new TargetTrace({ slug, sourceId }) };
   }
@@ -857,7 +831,7 @@ const query: Operation = {
     return_unit: RETURN_UNIT_PARAM,
     return_window: RETURN_WINDOW_PARAM,
     token_budget: { type: 'number', description: 'Evidence token cap.' },
-    expand: { type: 'boolean', description: 'Default per search mode (tokenmax on).' },
+    expand: { type: 'boolean', description: 'Default off; search.expansion overrides.' },
     detail: { type: 'string', description: 'low (compiled truth), medium (default) or high (all chunks).' },
     fields: FIELDS_PARAM,
     mode: { type: 'string', description: 'Local callers only.' },
@@ -1083,8 +1057,8 @@ const query: Operation = {
       // the first pass actually did (`expansion_applied`), not what was
       // requested: a first pass that produced expansion variants doesn't pay
       // for a second expansion LLM call + rerank over a near-identical query,
-      // while one that ran without expansion (the mode default outside
-      // tokenmax, an explicit opt-out, or an expander that produced nothing)
+      // while one that ran without expansion (the default, an explicit
+      // opt-out, or an expander that produced nothing)
       // can still escalate.
       if (shouldEscalateRetrieval(grade, {
         enabled: escalationCfg === 'true',
